@@ -12,3 +12,15 @@ checkpoint-*.js
 fix-embedded-nav-*.js
 shopify.app.*.toml
 !shopify.app.example.toml
+*.bak
+*.bak.*
+checkpoint-*.js
+fix-*.js
+debug-*.js
+diagnose-*.js
+repair-*.js
+rollback-*.js
+switch-*.js
+add-customer-*.js
+hide-customer-*.js
+rebrand-*.js
