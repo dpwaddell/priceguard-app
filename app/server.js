@@ -657,7 +657,7 @@ function renderPublicHome() {
           <p>Embedded App shell is ready.</p>
           <form class="row" method="get" action="/install">
             <input name="shop" placeholder="store-name.myshopify.com" />
-            <button type="submit">Install app</button>
+            <button type="submit">Install App</button>
           </form>
           <ul>
             <li><a href="/health">/health</a></li>
@@ -735,11 +735,11 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
   const assignmentsUrl = getEmbeddedAppUrl(shop, host, "/customer-assignments");
 
   const checklist = [
-    { label: "Install app", done: true, desc: "OAuth and token storage complete." },
-    { label: "Create first pricing tier", done: dashboard.counts.tiers > 0, desc: "Set up Gold, Silver, VIP or another trade tier." },
-    { label: "Assign first trade customer", done: dashboard.counts.assignments > 0, desc: "Link a customer to a pricing tier." },
-    { label: "Add specific product prices", done: dashboard.counts.overrides > 0, desc: "Create customer-specific price overrides where needed." },
-    { label: "Review configuration", done: dashboard.counts.tiers > 0 && dashboard.counts.assignments > 0, desc: "Confirm your tier and customer assignment setup is ready for testing." }
+    { label: "Install App", done: true, desc: "OAuth and token storage complete." },
+    { label: "Create First Pricing Tier", done: dashboard.counts.tiers > 0, desc: "Set up Gold, Silver, VIP or another trade tier." },
+    { label: "Assign First Trade Customer", done: dashboard.counts.assignments > 0, desc: "Link a customer to a pricing tier." },
+    { label: "Add Specific Product Prices", done: dashboard.counts.overrides > 0, desc: "Create customer-specific price overrides where needed." },
+    { label: "Review Configuration", done: dashboard.counts.tiers > 0 && dashboard.counts.assignments > 0, desc: "Confirm your tier and customer assignment setup is ready for testing." }
   ];
 
   const checklistHtml = checklist.map(item => `
@@ -779,8 +779,8 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
           <div class="mini-grid">
             <div class="stat"><div class="stat-label">Trade Customers</div><div class="stat-value">${escapeHtml(usageText)}</div></div>
             <div class="stat"><div class="stat-label">Pricing tiers</div><div class="stat-value">${dashboard.counts.tiers}</div></div>
-            <div class="stat"><div class="stat-label">Price overrides</div><div class="stat-value">${dashboard.counts.overrides}</div></div>
-            <div class="stat"><div class="stat-label">CSV imports</div><div class="stat-value">${dashboard.counts.imports}</div></div>
+            <div class="stat"><div class="stat-label">Price Overrides</div><div class="stat-value">${dashboard.counts.overrides}</div></div>
+            <div class="stat"><div class="stat-label">CSV Imports</div><div class="stat-value">${dashboard.counts.imports}</div></div>
           </div>
         </div>
 
