@@ -7,3 +7,8 @@ backups/
 *.log
 npm-debug.log*
 .DS_Store
+*.bak.*
+checkpoint-*.js
+fix-embedded-nav-*.js
+shopify.app.*.toml
+!shopify.app.example.toml
