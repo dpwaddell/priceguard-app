@@ -33,11 +33,15 @@ async function shopifyAdminGraphQL(shopDomain, accessToken, query, variables = {
   const json = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(`Shopify GraphQL request failed: ${response.status}`);
+    throw new Error("Shopify customer search request failed. Please try again.");
   }
 
   if (json.errors && json.errors.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+    const raw = JSON.stringify(json.errors);
+    if (raw.includes("ACCESS_DENIED") || raw.includes("protected-customer-data") || raw.includes("Customer object")) {
+      throw new Error("Customer search is unavailable until this app is approved for Shopify protected customer data. You can still create assignments manually for now.");
+    }
+    throw new Error("Shopify customer search failed. Please try again.");
   }
 
   return json.data || {};
@@ -1280,7 +1284,7 @@ app.post("/customer-assignments/:id/delete", async (req, res) => {
 function renderCustomerSearchPage({ shop, host, apiKey, query = "", customers = [], error = "" }) {
   const searchValue = escapeHtml(query || "");
   const resultsHtml = error
-    ? `<div class="empty">Search failed: ${escapeHtml(error)}</div>`
+    ? `<div class="empty">Search unavailable: ${escapeHtml(error)}</div>`
     : customers.length === 0 && query
       ? `<div class="empty">No Shopify customers found for that search.</div>`
       : customers.map((customer) => {
@@ -1312,7 +1316,7 @@ function renderCustomerSearchPage({ shop, host, apiKey, query = "", customers = 
       <div>
         <h1>Search Shopify customers</h1>
         <div class="sub">
-          Find an existing Shopify customer, then send their email and Shopify customer ID back into the assignment form.
+          Find an existing Shopify customer, then send their email and Shopify customer ID back into the assignment form. If customer search is not yet approved by Shopify, create assignments manually for now.
         </div>
       </div>
       <div class="shop-meta">
@@ -1332,7 +1336,7 @@ function renderCustomerSearchPage({ shop, host, apiKey, query = "", customers = 
             <div class="form-grid">
               <div class="field full">
                 <label for="q">Search by email or name</label>
-                <input id="q" name="q" value="${searchValue}" placeholder="e.g. buyer@example.com or Dan Waddell" />
+                <input id="q" name="q" value="${searchValue}" placeholder="e.g. buyer@example.com or John Smith" />
               </div>
             </div>
             <div class="actions">
