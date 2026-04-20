@@ -681,7 +681,7 @@ function renderBrandHero(opts) {
   const active = opts.active || "dashboard";
 
   const logoHtml =
-    '<img src="/assets/priceguard-logo.png?v=3" alt="PriceGuard logo" onerror="this.style.display=\'none\'; this.nextElementSibling.style.display=\'flex\';" />' +
+    '<img src="/assets/priceguard-logo.png?v=4" alt="PriceGuard logo" onerror="this.style.display=\'none\'; this.nextElementSibling.style.display=\'flex\';" />' +
     '<div class="brand-logo-fallback" style="display:none;">PG</div>';
 
   return ''
