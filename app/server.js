@@ -1102,6 +1102,9 @@ app.get("/customer-assignments", async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
+    const lookup = String(req.query.lookup || "").trim();
+    const useEmail = String(req.query.use_email || "").trim();
+    const useId = String(req.query.use_id || "").trim();
     if (!shop) return res.status(400).send("Missing or invalid shop.");
 
     const dashboard = await getDashboardData(shop);
