@@ -1,7 +1,7 @@
 services:
-  priceflow-db:
+  priceguard-db:
     image: postgres:16-alpine
-    container_name: priceflow-db
+    container_name: priceguard-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: priceflow_db
@@ -12,9 +12,9 @@ services:
     ports:
       - "5434:5432"
 
-  priceflow-app:
+  priceguard-app:
     image: node:20-alpine
-    container_name: priceflow-app
+    container_name: priceguard-app
     restart: unless-stopped
     working_dir: /app
     env_file:
@@ -25,4 +25,4 @@ services:
     ports:
       - "3100:3100"
     depends_on:
-      - priceflow-db
+      - priceguard-db

@@ -192,7 +192,7 @@ async function ensureShopAndSettings({ shopDomain, accessToken = null }) {
 
     await client.query(
       `INSERT INTO audit_logs (shop_id, actor_type, actor_email, action, entity_type, entity_id, metadata_json)
-       VALUES ($1, 'system', 'system@priceflow.local', $2, 'shop', $3, $4::jsonb)`,
+       VALUES ($1, 'system', 'system@priceguard.local', $2, 'shop', $3, $4::jsonb)`,
       [shop.id, accessToken ? "oauth_install_complete" : "shop_record_created", String(shop.id), JSON.stringify({ shop_domain: shopDomain })]
     );
 
@@ -318,7 +318,7 @@ async function getCustomerAssignments(shopId) {
 async function writeAudit(shopId, action, entityType, entityId, metadata = {}) {
   await pool.query(
     `INSERT INTO audit_logs (shop_id, actor_type, actor_email, action, entity_type, entity_id, metadata_json)
-     VALUES ($1, 'system', 'system@priceflow.local', $2, $3, $4, $5::jsonb)`,
+     VALUES ($1, 'system', 'system@priceguard.local', $2, $3, $4, $5::jsonb)`,
     [shopId, action, entityType, String(entityId), JSON.stringify(metadata)]
   );
 }
@@ -439,7 +439,7 @@ function renderPublicHome() {
   return `
     <html>
       <head>
-        <title>PriceFlow</title>
+        <title>PriceGuard</title>
         <style>
           body { font-family: Arial, sans-serif; padding: 32px; color: #111; }
           .card { max-width: 760px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; }
@@ -452,7 +452,7 @@ function renderPublicHome() {
       </head>
       <body>
         <div class="card">
-          <h1>PriceFlow</h1>
+          <h1>PriceGuard</h1>
           <p>Embedded app shell is ready.</p>
           <form class="row" method="get" action="/install">
             <input name="shop" placeholder="store-name.myshopify.com" />
@@ -518,7 +518,7 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
   const content = `
     <div class="topbar">
       <div>
-        <h1>PriceFlow</h1>
+        <h1>PriceGuard</h1>
         <div class="sub">
           Give every trade customer the right price automatically. Start with one trade customer on the free plan, then scale with tiers, overrides and CSV imports.
         </div>
@@ -583,7 +583,7 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
     </div>
   `;
 
-  return renderLayout({ shop, host, apiKey, title: "PriceFlow", content });
+  return renderLayout({ shop, host, apiKey, title: "PriceGuard", content });
 }
 
 function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers }) {
@@ -725,7 +725,7 @@ function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers }) {
     </div>
   `;
 
-  return renderLayout({ shop, host, apiKey, title: "PriceFlow | Pricing tiers", content });
+  return renderLayout({ shop, host, apiKey, title: "PriceGuard | Pricing tiers", content });
 }
 
 function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, assignments }) {
@@ -871,7 +871,7 @@ function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, a
     </div>
   `;
 
-  return renderLayout({ shop, host, apiKey, title: "PriceFlow | Customer assignments", content });
+  return renderLayout({ shop, host, apiKey, title: "PriceGuard | Customer assignments", content });
 }
 
 app.get("/", async (req, res) => {
@@ -1368,5 +1368,5 @@ app.get("/debug/shops", async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`PriceFlow listening on ${port}`);
+  console.log(`PriceGuard listening on ${port}`);
 });
