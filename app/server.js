@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const crypto = require("crypto");
 const path = require("path");
 const { Pool } = require("pg");
 const {
@@ -19,6 +20,39 @@ const pool = new Pool({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+function safeTimingEqual(a, b) {
+  const aBuf = Buffer.from(String(a || ""), "utf8");
+  const bBuf = Buffer.from(String(b || ""), "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function verifyShopifyWebhookHmac(req) {
+  const secret = process.env.SHOPIFY_API_SECRET || "";
+  if (!secret) return false;
+
+  const header = req.get("X-Shopify-Hmac-Sha256") || "";
+  const rawBody = req.body && Buffer.isBuffer(req.body) ? req.body : Buffer.from("");
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("base64");
+
+  return safeTimingEqual(digest, header);
+}
+
+function parseWebhookJsonBody(req) {
+  try {
+    if (!req.body || !Buffer.isBuffer(req.body)) return {};
+    const str = req.body.toString("utf8") || "{}";
+    return JSON.parse(str);
+  } catch {
+    return {};
+  }
+}
+
 app.use("/assets", express.static(path.join(__dirname, "public")));
 
 async function shopifyAdminGraphQL(shopDomain, accessToken, query, variables = {}) {
@@ -1829,6 +1863,89 @@ app.get("/pricing-preview", async (req, res) => {
   }
 });
 
+
+
+
+app.post("/webhooks/customers/data_request", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    if (!verifyShopifyWebhookHmac(req)) {
+      return res.status(400).send("Invalid webhook signature");
+    }
+
+    const payload = parseWebhookJsonBody(req);
+    console.log("[SHOPIFY_COMPLIANCE] customers/data_request", {
+      shop: req.get("X-Shopify-Shop-Domain") || "",
+      payload
+    });
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("[SHOPIFY_COMPLIANCE] customers/data_request failed", err);
+    return res.status(200).send("OK");
+  }
+});
+
+app.post("/webhooks/customers/redact", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    if (!verifyShopifyWebhookHmac(req)) {
+      return res.status(400).send("Invalid webhook signature");
+    }
+
+    const payload = parseWebhookJsonBody(req);
+    console.log("[SHOPIFY_COMPLIANCE] customers/redact", {
+      shop: req.get("X-Shopify-Shop-Domain") || "",
+      payload
+    });
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("[SHOPIFY_COMPLIANCE] customers/redact failed", err);
+    return res.status(200).send("OK");
+  }
+});
+
+app.post("/webhooks/shop/redact", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    if (!verifyShopifyWebhookHmac(req)) {
+      return res.status(400).send("Invalid webhook signature");
+    }
+
+    const payload = parseWebhookJsonBody(req);
+    console.log("[SHOPIFY_COMPLIANCE] shop/redact", {
+      shop: req.get("X-Shopify-Shop-Domain") || "",
+      payload
+    });
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("[SHOPIFY_COMPLIANCE] shop/redact failed", err);
+    return res.status(200).send("OK");
+  }
+});
+
+
+
+app.post("/webhooks/compliance", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    if (!verifyShopifyWebhookHmac(req)) {
+      return res.status(400).send("Invalid webhook signature");
+    }
+
+    const payload = parseWebhookJsonBody(req);
+    const topic = req.get("X-Shopify-Topic") || "";
+
+    console.log("[SHOPIFY_COMPLIANCE] generic", {
+      topic,
+      shop: req.get("X-Shopify-Shop-Domain") || "",
+      payload
+    });
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("[SHOPIFY_COMPLIANCE] generic failed", err);
+    return res.status(200).send("OK");
+  }
+});
 
 app.get("/health", async (req, res) => {
   try {
