@@ -1,6 +1,7 @@
 {
-  "name": "priceflow-app",
-  "version": "0.2.0",
+  "name": "priceguard",
+  "version": "1.0.0",
+  "description": "Customer-specific pricing for Shopify — trade, wholesale and VIP accounts",
   "private": true,
   "main": "server.js",
   "scripts": {

@@ -51,7 +51,8 @@ async function exchangeCodeForToken({ shop, code }) {
   const body = JSON.stringify({
     client_id: process.env.SHOPIFY_API_KEY,
     client_secret: process.env.SHOPIFY_API_SECRET,
-    code
+    code,
+    expiring: 1
   });
 
   const res = await fetch(url, {
@@ -65,7 +66,12 @@ async function exchangeCodeForToken({ shop, code }) {
     throw new Error(`Token exchange failed: ${res.status} ${text}`);
   }
 
-  return res.json();
+  const json = await res.json();
+  return {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token || null,
+    expires_in: json.expires_in || null
+  };
 }
 
 module.exports = {

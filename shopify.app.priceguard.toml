@@ -21,19 +21,29 @@ redirect_urls = [ "https://priceguard.sample-guard.com/auth/callback" ]
 [app_preferences]
 url = "https://priceguard.sample-guard.com/settings"
 
-
-
-
-
-
-
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request"]
+uri = "/webhooks/customers/data_request"
 
 [[webhooks.subscriptions]]
-compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
-uri = "/webhooks/compliance"
+compliance_topics = ["customers/redact"]
+uri = "/webhooks/customers/redact"
 
+[[webhooks.subscriptions]]
+compliance_topics = ["shop/redact"]
+uri = "/webhooks/shop/redact"
+
+[[webhooks.subscriptions]]
+topics = ["app/uninstalled"]
+uri = "/webhooks/app/uninstalled"
 
 [app_proxy]
-url = "/proxy"
+url = "https://priceguard.sample-guard.com/proxy"
 prefix = "apps"
 subpath = "priceguard"
+
+[[extensions]]
+handle = "priceguard-pricing"
+type = "theme"
+# blocks/priceguard-pricing.liquid          — target: section (product page block)
+# blocks/priceguard-pricing-sitewide.liquid — target: body   (site-wide app embed)

@@ -1,2 +1,7 @@
-name = "priceguard-pricing"
+api_version = "2026-04"
+uid = "2fb1314c-6ce8-8730-1d2b-c75d326aa555c7629e4d"
+
+[[extensions]]
+handle = "priceguard-pricing"
+name = "PriceGuard Customer Prices"
 type = "theme"

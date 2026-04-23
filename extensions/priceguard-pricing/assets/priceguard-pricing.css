@@ -1,10 +1,20 @@
+/* Force .price__sale visible when PriceGuard has injected into it —
+   themes typically hide this container when no compare-at price exists. */
+.price__sale:has(.priceguard-price-wrap),
+.price--on-sale:has(.priceguard-price-wrap) {
+  display: block !important;
+}
+
 .priceguard-price-wrap {
   display: block;
 }
 
 .priceguard-final-price {
+  display: inline-block;
+  font-size: 1.4em;
+  font-weight: 800;
   color: #0f172a !important;
-  font-weight: 800 !important;
+  line-height: 1.2;
 }
 
 .priceguard-original-price {

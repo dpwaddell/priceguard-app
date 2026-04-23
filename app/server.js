@@ -11,12 +11,16 @@ const {
   exchangeCodeForToken
 } = require("./shopify-auth");
 
+const APP_VERSION = require("./package.json").version;
+
 const app = express();
 const port = process.env.PORT || 3100;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
+
+const oauthStates = new Map();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -81,6 +85,125 @@ async function shopifyAdminGraphQL(shopDomain, accessToken, query, variables = {
   }
 
   return json.data || {};
+}
+
+async function createShopifySubscription(shopDomain, accessToken, returnUrl, planName = 'pro') {
+  const PLAN_CONFIG = {
+    growth: { name: 'PriceGuard Growth', price: 9.00 },
+    pro:    { name: 'PriceGuard Pro',    price: 19.00 }
+  };
+  const plan = PLAN_CONFIG[planName] || PLAN_CONFIG.pro;
+
+  const mutation = `#graphql
+    mutation AppSubscriptionCreate(
+      $name: String!
+      $lineItems: [AppSubscriptionLineItemInput!]!
+      $returnUrl: URL!
+      $trialDays: Int!
+    ) {
+      appSubscriptionCreate(
+        name: $name
+        lineItems: $lineItems
+        returnUrl: $returnUrl
+        trialDays: $trialDays
+      ) {
+        appSubscription { id status }
+        confirmationUrl
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const variables = {
+    name: plan.name,
+    returnUrl,
+    trialDays: 14,
+    lineItems: [
+      {
+        plan: {
+          appRecurringPricingDetails: {
+            price: { amount: plan.price, currencyCode: "USD" },
+            interval: "EVERY_30_DAYS"
+          }
+        }
+      }
+    ]
+  };
+
+  const response = await fetch(`https://${shopDomain}/admin/api/2026-04/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": accessToken
+    },
+    body: JSON.stringify({ query: mutation, variables })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Shopify billing API returned ${response.status}`);
+  }
+
+  const json = await response.json();
+
+  if (json.errors?.length) {
+    throw new Error(`Billing mutation error: ${JSON.stringify(json.errors)}`);
+  }
+
+  const result = json.data?.appSubscriptionCreate;
+  if (result?.userErrors?.length) {
+    throw new Error(`Billing user error: ${result.userErrors.map(e => e.message).join(", ")}`);
+  }
+
+  return result?.confirmationUrl || null;
+}
+
+async function getActiveSubscription(shopDomain, accessToken) {
+  const query = `#graphql
+    query {
+      currentAppInstallation {
+        activeSubscriptions {
+          id
+          name
+          status
+          trialDays
+          currentPeriodEnd
+          lineItems {
+            id
+            plan {
+              pricingDetails {
+                ... on AppRecurringPricing {
+                  price { amount currencyCode }
+                  interval
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await fetch(`https://${shopDomain}/admin/api/2026-04/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": accessToken
+    },
+    body: JSON.stringify({ query })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Shopify billing query returned ${response.status}`);
+  }
+
+  const json = await response.json();
+
+  if (json.errors?.length) {
+    throw new Error(`Billing query error: ${JSON.stringify(json.errors)}`);
+  }
+
+  const subs = json.data?.currentAppInstallation?.activeSubscriptions || [];
+  return subs.length > 0 ? subs[0] : null;
 }
 
 async function searchShopifyCustomers(shopDomain, term) {
@@ -199,21 +322,24 @@ function getEmbeddedAppUrl(shop, host = "", path = "/") {
   return `${base}${cleanPath}?${params.toString()}`;
 }
 
-async function ensureShopAndSettings({ shopDomain, accessToken = null }) {
+async function ensureShopAndSettings({ shopDomain, accessToken = null, refreshToken = null, expiresIn = null }) {
+  const tokenExpiresAt = expiresIn ? new Date(Date.now() + expiresIn * 1000) : null;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     const shopRes = await client.query(
-      `INSERT INTO shops (shop_domain, access_token, installed_at, plan_name, plan_status, created_at, updated_at)
-       VALUES ($1, $2, NOW(), 'free', 'active', NOW(), NOW())
+      `INSERT INTO shops (shop_domain, access_token, refresh_token, token_expires_at, installed_at, plan_name, plan_status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), 'free', 'active', NOW(), NOW())
        ON CONFLICT (shop_domain)
        DO UPDATE SET
          access_token = COALESCE(EXCLUDED.access_token, shops.access_token),
+         refresh_token = COALESCE(EXCLUDED.refresh_token, shops.refresh_token),
+         token_expires_at = COALESCE(EXCLUDED.token_expires_at, shops.token_expires_at),
          installed_at = COALESCE(shops.installed_at, NOW()),
          updated_at = NOW()
        RETURNING id, shop_domain, plan_name, plan_status`,
-      [shopDomain, accessToken]
+      [shopDomain, accessToken, refreshToken, tokenExpiresAt]
     );
 
     const shop = shopRes.rows[0];
@@ -269,7 +395,7 @@ async function getDashboardData(shopDomain) {
     const shop = shopRes.rows[0];
 
     const settingsRes = await client.query(
-      `SELECT onboarding_complete, free_plan_customer_limit, pricing_display_mode, app_enabled
+      `SELECT onboarding_complete, free_plan_customer_limit, pricing_display_mode, app_enabled, reviewed_at
        FROM settings
        WHERE shop_id = $1
        LIMIT 1`,
@@ -300,8 +426,24 @@ async function getDashboardData(shopDomain) {
       onboarding_complete: false,
       free_plan_customer_limit: 1,
       pricing_display_mode: "replace",
-      app_enabled: true
+      app_enabled: true,
+      reviewed_at: null
     };
+
+    if (!settings.onboarding_complete) {
+      const allDone =
+        tierCountRes.rows[0].count > 0 &&
+        assignmentCountRes.rows[0].count > 0 &&
+        (overrideCountRes.rows[0].count > 0 || !!settings.reviewed_at) &&
+        !!settings.reviewed_at;
+      if (allDone) {
+        await client.query(
+          `UPDATE settings SET onboarding_complete = true, updated_at = NOW() WHERE shop_id = $1`,
+          [shop.id]
+        );
+        settings.onboarding_complete = true;
+      }
+    }
 
     return {
       shop,
@@ -387,6 +529,14 @@ async function writeAudit(shopId, action, entityType, entityId, metadata = {}) {
      VALUES ($1, 'system', 'system@priceguard.local', $2, $3, $4, $5::jsonb)`,
     [shopId, action, entityType, String(entityId), JSON.stringify(metadata)]
   );
+}
+
+function getPlanLimits(planName) {
+  switch (planName) {
+    case 'growth': return { tierLimit: 3,    customerLimit: 20,   skuOverrides: true,  csvImport: false, scheduling: false };
+    case 'pro':    return { tierLimit: null,  customerLimit: null, skuOverrides: true,  csvImport: true,  scheduling: true  };
+    default:       return { tierLimit: 1,     customerLimit: 1,    skuOverrides: false, csvImport: false, scheduling: false };
+  }
 }
 
 function renderLayout({ shop, host, apiKey, title, content }) {
@@ -914,6 +1064,12 @@ function renderLayout({ shop, host, apiKey, title, content }) {
         });
       }
     </script>
+    <div style="margin-top:32px;padding:16px 0 8px;border-top:1px solid #e5e7eb;text-align:center;font-size:13px;color:#9ca3af;">
+      PriceGuard v${APP_VERSION} &middot;
+      <a href="/privacy" target="_blank" style="color:#9ca3af;text-decoration:none;">Privacy Policy</a> &middot;
+      <a href="/terms" target="_blank" style="color:#9ca3af;text-decoration:none;">Terms of Service</a> &middot;
+      <a href="mailto:support@sample-guard.com" style="color:#9ca3af;text-decoration:none;">Support</a>
+    </div>
       </div>
   </body>
 </html>
@@ -945,8 +1101,6 @@ function renderPublicHome() {
           </form>
           <ul>
             <li><a href="/health">/health</a></li>
-            <li><a href="/debug/schema">/debug/schema</a></li>
-            <li><a href="/debug/shops">/debug/shops</a></li>
           </ul>
         </div>
       </body>
@@ -993,12 +1147,15 @@ function renderNav(shop, host, active) {
   const tiersUrl = getEmbeddedAppUrl(shop, host, "/pricing-tiers");
   const assignmentsUrl = getEmbeddedAppUrl(shop, host, "/customer-assignments");
   const previewUrl = getEmbeddedAppUrl(shop, host, "/pricing-preview");
+  const pricesUrl = getEmbeddedAppUrl(shop, host, "/customer-product-prices");
   return `
-    <div class="nav">
+    <div class="nav" style="overflow-x:auto;flex-wrap:nowrap;white-space:nowrap;">
       <button type="button" class="btn ${active === "dashboard" ? "primary" : ""}" onclick="window.location.href='${dashUrl}'">Dashboard</button>
       <button type="button" class="btn ${active === "tiers" ? "primary" : ""}" onclick="window.location.href='${tiersUrl}'">Pricing Tiers</button>
       <button type="button" class="btn ${active === "assignments" ? "primary" : ""}" onclick="window.location.href='${assignmentsUrl}'">Customer Assignments</button>
+      <button type="button" class="btn ${active === "prices" ? "primary" : ""}" onclick="window.location.href='${pricesUrl}'">Price Overrides</button>
       <button type="button" class="btn ${active === "preview" ? "primary" : ""}" onclick="window.location.href='${previewUrl}'">Pricing Preview</button>
+      <a class="btn" href="mailto:support@sample-guard.com" style="text-decoration:none;">Support</a>
     </div>
   `;
 }
@@ -1011,9 +1168,9 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
     ? new Date(dashboard.shop.installed_at).toLocaleString("en-GB")
     : "—";
 
-  const customerLimit = Number(dashboard.settings.free_plan_customer_limit || 1);
+  const { customerLimit } = getPlanLimits(dashboard.shop.plan_name);
   const assignedCount = Number(dashboard.counts.assignments || 0);
-  const usageText = `${assignedCount} / ${customerLimit}`;
+  const usageText = customerLimit !== null ? `${assignedCount} / ${customerLimit}` : String(assignedCount);
   const onboardingDone = !!dashboard.settings.onboarding_complete;
   const tierUrl = getEmbeddedAppUrl(shop, host, "/pricing-tiers");
   const assignmentsUrl = getEmbeddedAppUrl(shop, host, "/customer-assignments");
@@ -1022,8 +1179,8 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
     { label: "Install App", done: true, desc: "OAuth and token storage complete." },
     { label: "Create First Pricing Tier", done: dashboard.counts.tiers > 0, desc: "Set up Gold, Silver, VIP or another trade tier." },
     { label: "Assign First Trade Customer", done: dashboard.counts.assignments > 0, desc: "Link a customer to a pricing tier." },
-    { label: "Add Specific Product Prices", done: dashboard.counts.overrides > 0, desc: "Create customer-specific price overrides where needed." },
-    { label: "Review Configuration", done: dashboard.counts.tiers > 0 && dashboard.counts.assignments > 0, desc: "Confirm your tier and customer assignment setup is ready for testing." }
+    { label: "Add Specific Product Prices", done: dashboard.counts.overrides > 0 || !!dashboard.settings.reviewed_at, desc: "Create customer-specific price overrides where needed." },
+    { label: "Review Configuration", done: !!dashboard.settings.reviewed_at, desc: "Confirm your tier and customer assignment setup is ready for testing." }
   ];
 
   const checklistHtml = checklist.map(item => `
@@ -1068,9 +1225,31 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
           </div>
         </div>
 
+        ${dashboard.shop.plan_name === 'free' ? `<div style="padding:16px 18px;background:linear-gradient(135deg,#0b1f55,#1a3a8a);border-radius:18px;color:#fff;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <div style="font-weight:700;font-size:15px;margin-bottom:4px;">You're on the Free plan — 1 tier, 1 customer.</div>
+            <div style="font-size:13px;opacity:0.85;">Upgrade to Growth ($9/mo) for 3 tiers and 20 customers, or Pro ($19/mo) for unlimited.</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=growth" style="background:rgba(255,255,255,0.15);color:#fff;font-weight:700;padding:10px 16px;border-radius:12px;text-decoration:none;font-size:14px;white-space:nowrap;border:1px solid rgba(255,255,255,0.3);">Growth — $9/mo</a>
+            <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro" style="background:#fff;color:#0b1f55;font-weight:700;padding:10px 16px;border-radius:12px;text-decoration:none;font-size:14px;white-space:nowrap;">Pro — $19/mo</a>
+          </div>
+        </div>` : ''}
+        ${dashboard.shop.plan_name === 'growth' ? `<div style="padding:16px 18px;background:linear-gradient(135deg,#0b4f6c,#0b7da0);border-radius:18px;color:#fff;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <div style="font-weight:700;font-size:15px;margin-bottom:4px;">You're on the Growth plan — 3 tiers, 20 customers.</div>
+            <div style="font-size:13px;opacity:0.85;">Upgrade to Pro ($19/mo) for unlimited tiers, CSV import, and scheduled pricing.</div>
+          </div>
+          <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro" style="background:#fff;color:#0b4f6c;font-weight:700;padding:10px 16px;border-radius:12px;text-decoration:none;font-size:14px;white-space:nowrap;">Upgrade to Pro — $19/mo</a>
+        </div>` : ''}
         <div class="card">
           <h2>Onboarding checklist</h2>
           ${checklistHtml}
+          ${!dashboard.settings.reviewed_at ? `<div class="actions" style="margin-top:4px;">
+            <form method="post" action="/dashboard/mark-reviewed?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}">
+              <button class="btn" type="submit">Mark as reviewed</button>
+            </form>
+          </div>` : ''}
         </div>
       </div>
 
@@ -1089,8 +1268,30 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
 
         <div class="card">
           <h2>How PriceGuard Works</h2>
-          <div class="muted">
-            Create pricing tiers, assign customers, and validate pricing before launch.
+          <div class="list">
+            <div class="list-row">
+              <div><strong>1. Create a Pricing Tier</strong></div>
+              <div class="muted">Define a tier (e.g. Gold, Trade, VIP) with a percentage or fixed discount and optional date range.</div>
+            </div>
+            <div class="list-row">
+              <div><strong>2. Assign Customers</strong></div>
+              <div class="muted">Link a customer's email address to a tier. Free plan supports 1 customer; Premium is unlimited.</div>
+            </div>
+            <div class="list-row">
+              <div><strong>3. Optional: Add Product Prices</strong></div>
+              <div class="muted">Set exact fixed prices on specific products for a customer, overriding their tier discount.</div>
+            </div>
+            <div class="list-row">
+              <div><strong>4. Enable the Theme Extension</strong></div>
+              <div class="muted">Activate the PriceGuard block in your Shopify theme to display trade prices on product pages.</div>
+            </div>
+            <div class="list-row">
+              <div><strong>5. Test with a Customer Account</strong></div>
+              <div class="muted">Use the Pricing Preview tab to check prices before going live, then confirm in the storefront.</div>
+            </div>
+          </div>
+          <div style="margin-top:14px;font-size:13px;color:#9ca3af;">
+            Questions? Email <a href="mailto:support@sample-guard.com" style="color:#0b1f55;">support@sample-guard.com</a>
           </div>
         </div>
       </div>
@@ -1100,7 +1301,7 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
   return renderLayout({ shop, host, apiKey, title: "PriceGuard", content });
 }
 
-function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers }) {
+function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers, tierCount = 0, tierLimit = null }) {
   const rows = tiers.length === 0
     ? `<div class="empty">No pricing tiers yet. Create your first tier below to begin.</div>`
     : `
@@ -1169,56 +1370,75 @@ function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers }) {
 
       <div class="stack">
         <div class="card">
-          <h2>Create pricing tier</h2>
-          <form method="post" action="/pricing-tiers?shop=${encodeURIComponent(shop)}${host ? `&host=${encodeURIComponent(host)}` : ""}">
-            <div class="form-grid">
-              <div class="field">
-                <label for="name">Tier name</label>
-                <input id="name" name="name" placeholder="Gold" required />
-              </div>
-
-              <div class="field">
-                <label for="customer_tag">Customer tag</label>
-                <input id="customer_tag" name="customer_tag" placeholder="trade-gold" />
-              </div>
-
-              <div class="field">
-                <label for="discount_type">Discount type</label>
-                <select id="discount_type" name="discount_type" required>
-                  <option value="percentage">Percentage</option>
-                  <option value="fixed_amount">Fixed amount</option>
-                </select>
-              </div>
-
-              <div class="field">
-                <label for="discount_value">Discount value</label>
-                <input id="discount_value" name="discount_value" type="number" step="0.01" min="0" placeholder="20" required />
-              </div>
-
-              <div class="field">
-                <label for="starts_at">Effective from</label>
-                <input id="starts_at" name="starts_at" type="datetime-local" />
-              </div>
-
-              <div class="field">
-                <label for="ends_at">Effective to</label>
-                <input id="ends_at" name="ends_at" type="datetime-local" />
-              </div>
-
-              <div class="field full">
-                <label for="is_enabled">Status</label>
-                <select id="is_enabled" name="is_enabled">
-                  <option value="true">Enabled</option>
-                  <option value="false">Draft / disabled</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="actions">
-              <button class="btn primary" type="submit">Create tier</button>
-              <a class="btn" href="${getEmbeddedAppUrl(shop, host, "/")}">Back to dashboard</a>
-            </div>
-          </form>
+          ${(() => {
+            const limitReached = tierLimit !== null && tierCount >= tierLimit;
+            const usageBadge = tierLimit !== null
+              ? `<span style="float:right;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;background:${limitReached ? '#fef2f2' : '#f3f4f6'};color:${limitReached ? '#991b1b' : '#6b7280'}">${tierCount}/${tierLimit} tiers used</span>`
+              : '';
+            if (limitReached) {
+              const isGrowth = dashboard.shop.plan_name === 'growth';
+              const upgradeMsg = isGrowth
+                ? 'You have reached the Growth plan limit of 3 tiers. Upgrade to Pro for unlimited tiers.'
+                : 'You have reached the Free plan limit of 1 tier. Upgrade to Growth (3 tiers) or Pro (unlimited).';
+              const upgradeActions = isGrowth
+                ? `<a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Upgrade to Pro — $19/mo</a>`
+                : `<a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=growth">Growth — $9/mo</a>
+                   <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Pro — $19/mo</a>`;
+              return `<h2>Create pricing tier ${usageBadge}</h2>
+                <div class="empty" style="margin-bottom:12px;">${upgradeMsg}</div>
+                <div class="actions">
+                  ${upgradeActions}
+                  <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/')}">Back to dashboard</a>
+                </div>`;
+            }
+            return `<h2>Create pricing tier ${usageBadge}</h2>
+              <form method="post" action="/pricing-tiers?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}">
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="name">Tier name</label>
+                    <input id="name" name="name" placeholder="Gold" required />
+                  </div>
+                  <div class="field">
+                    <label for="customer_tag">Customer tag</label>
+                    <input id="customer_tag" name="customer_tag" placeholder="trade-gold" />
+                  </div>
+                  <div class="field">
+                    <label for="discount_type">Discount type</label>
+                    <select id="discount_type" name="discount_type" required>
+                      <option value="percentage">Percentage</option>
+                      <option value="fixed_amount">Fixed amount</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="discount_value">Discount value</label>
+                    <input id="discount_value" name="discount_value" type="number" step="0.01" min="0" placeholder="20" required />
+                  </div>
+                  ${getPlanLimits(dashboard.shop.plan_name).scheduling ? `
+                  <div class="field">
+                    <label for="starts_at">Effective from</label>
+                    <input id="starts_at" name="starts_at" type="datetime-local" />
+                  </div>
+                  <div class="field">
+                    <label for="ends_at">Effective to</label>
+                    <input id="ends_at" name="ends_at" type="datetime-local" />
+                  </div>` : `
+                  <div class="field full">
+                    <div style="font-size:13px;color:#6b7280;padding:6px 0;">Scheduled pricing requires the <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro" style="color:#0b1f55;">Pro plan</a>.</div>
+                  </div>`}
+                  <div class="field full">
+                    <label for="is_enabled">Status</label>
+                    <select id="is_enabled" name="is_enabled">
+                      <option value="true">Enabled</option>
+                      <option value="false">Draft / disabled</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn primary" type="submit">Create tier</button>
+                  <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/')}">Back to dashboard</a>
+                </div>
+              </form>`;
+          })()}
         </div>
 
         <div class="card">
@@ -1236,8 +1456,13 @@ function renderPricingTiersPage({ shop, host, apiKey, dashboard, tiers }) {
   return renderLayout({ shop, host, apiKey, title: "PriceGuard | Pricing Tiers", content });
 }
 
-function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, assignments }) {
-  const customerLimit = Number(dashboard.settings.free_plan_customer_limit || 1);
+function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, assignments, tierCount = 0, tierLimit = null }) {
+  const { customerLimit, scheduling } = getPlanLimits(dashboard.shop.plan_name);
+  const distinctCustomerCount = new Set(assignments.map(a => a.customer_email)).size;
+  const customerLimitReached = customerLimit !== null && distinctCustomerCount >= customerLimit;
+  const customerUsageBadge = customerLimit !== null
+    ? `<span style="float:right;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;background:${customerLimitReached ? '#fef2f2' : '#f3f4f6'};color:${customerLimitReached ? '#991b1b' : '#6b7280'}">${distinctCustomerCount}/${customerLimit} customers</span>`
+    : '';
 
   const rows = assignments.length === 0
     ? `<div class="empty" style="min-height:140px; display:flex; align-items:flex-start;">No customer assignments yet. Create your first customer assignment to begin validating PriceGuard.</div>`
@@ -1310,7 +1535,7 @@ function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, a
 
       <div class="stack">
         <div class="card">
-          <h2>Assign customer to tier</h2>
+          <h2>Assign customer to tier ${customerUsageBadge}</h2>
           <div class="actions" style="margin-bottom:12px;">
             <div class="empty" style="margin-bottom:12px;">Shopify customer search is not enabled in this version. Enter the customer email and optional Shopify customer ID manually below.</div>
           </div>
@@ -1334,15 +1559,18 @@ function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, a
                 </select>
               </div>
 
+              ${scheduling ? `
               <div class="field">
                 <label for="starts_at">Effective from</label>
                 <input id="starts_at" name="starts_at" type="datetime-local" />
               </div>
-
               <div class="field">
                 <label for="ends_at">Effective to</label>
                 <input id="ends_at" name="ends_at" type="datetime-local" />
-              </div>
+              </div>` : `
+              <div class="field full">
+                <div style="font-size:13px;color:#6b7280;padding:6px 0;">Scheduled assignments require the <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro" style="color:#0b1f55;">Pro plan</a>.</div>
+              </div>`}
 
               <div class="field full">
                 <label for="is_enabled">Status</label>
@@ -1376,7 +1604,105 @@ function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, a
   return renderLayout({ shop, host, apiKey, title: "PriceGuard | Customer Assignments", content });
 }
 
-app.get("/", async (req, res) => {
+// --- Cookie and session helpers ---
+
+function getCookieValue(req, name) {
+  const header = req.headers.cookie || "";
+  for (const part of header.split(";")) {
+    const trimmed = part.trim();
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    if (trimmed.slice(0, eq).trim() === name) {
+      return decodeURIComponent(trimmed.slice(eq + 1));
+    }
+  }
+  return null;
+}
+
+function signValue(value) {
+  const secret = process.env.SHOPIFY_API_SECRET || "";
+  return crypto.createHmac("sha256", secret).update(String(value)).digest("hex");
+}
+
+function makeSignedCookie(value) {
+  return `${value}.${signValue(value)}`;
+}
+
+function readSignedCookie(raw) {
+  if (!raw) return null;
+  const dot = raw.lastIndexOf(".");
+  if (dot < 1) return null;
+  const value = raw.slice(0, dot);
+  const sig = raw.slice(dot + 1);
+  const expected = signValue(value);
+  try {
+    const a = Buffer.from(sig, "utf8");
+    const b = Buffer.from(expected, "utf8");
+    if (a.length !== b.length) return null;
+    return crypto.timingSafeEqual(a, b) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function createAppSession(shopId, shopDomain) {
+  const sessionKey = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  await pool.query(
+    `INSERT INTO app_sessions (shop_id, session_key, session_data, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3::jsonb, $4, NOW(), NOW())`,
+    [shopId, sessionKey, JSON.stringify({ shop_domain: shopDomain }), expiresAt]
+  );
+  return sessionKey;
+}
+
+async function requireShopSession(req, res, next) {
+  const shop = sanitizeShop(req.query.shop);
+  if (!shop) return res.status(400).send("Missing or invalid shop parameter.");
+
+  const raw = getCookieValue(req, "pg_session");
+  const sessionKey = readSignedCookie(raw);
+  if (!sessionKey) return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+
+  try {
+    const result = await pool.query(
+      `SELECT s.expires_at, sh.shop_domain
+       FROM app_sessions s
+       JOIN shops sh ON sh.id = s.shop_id
+       WHERE s.session_key = $1
+       LIMIT 1`,
+      [sessionKey]
+    );
+
+    if (result.rowCount === 0) {
+      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+    }
+
+    const row = result.rows[0];
+
+    if (new Date(row.expires_at) < new Date()) {
+      await pool.query("DELETE FROM app_sessions WHERE session_key = $1", [sessionKey]);
+      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+    }
+
+    if (row.shop_domain !== shop) {
+      return res.status(403).send("Session shop mismatch.");
+    }
+
+    return next();
+  } catch {
+    return res.status(500).send("Session verification failed. Please try again.");
+  }
+}
+
+async function requireShopSessionIfShop(req, res, next) {
+  if (!sanitizeShop(req.query.shop)) return next();
+  return requireShopSession(req, res, next);
+}
+
+// --- Routes ---
+
+app.get("/", requireShopSessionIfShop, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1401,7 +1727,7 @@ app.get("/", async (req, res) => {
   }
 });
 
-app.get("/pricing-tiers", async (req, res) => {
+app.get("/pricing-tiers", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1412,19 +1738,23 @@ app.get("/pricing-tiers", async (req, res) => {
 
     const tiers = await getPricingTiers(dashboard.shop.id);
 
+    const tierCount = tiers.length;
+    const { tierLimit } = getPlanLimits(dashboard.shop.plan_name);
     return res.send(renderPricingTiersPage({
       shop,
       host,
       apiKey: process.env.SHOPIFY_API_KEY || "",
       dashboard,
-      tiers
+      tiers,
+      tierCount,
+      tierLimit
     }));
   } catch (e) {
     return res.status(500).send(`Pricing Tiers load failed: ${escapeHtml(e.message)}`);
   }
 });
 
-app.post("/pricing-tiers", async (req, res) => {
+app.post("/pricing-tiers", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1451,6 +1781,18 @@ app.post("/pricing-tiers", async (req, res) => {
       return res.status(400).send("Discount value must be a valid positive number.");
     }
 
+    const limits = getPlanLimits(shopRow.plan_name);
+    if (!limits.scheduling && (startsAt || endsAt)) {
+      return res.status(403).send("Scheduled pricing (starts_at / ends_at) requires the Pro plan.");
+    }
+    const existingTierCount = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM pricing_tiers WHERE shop_id = $1`,
+      [shopRow.id]
+    );
+    if (limits.tierLimit !== null && existingTierCount.rows[0].count >= limits.tierLimit) {
+      return res.status(400).send(`Your plan is limited to ${limits.tierLimit} pricing tier(s). Upgrade to unlock more.`);
+    }
+
     const insert = await pool.query(
       `INSERT INTO pricing_tiers
         (shop_id, name, customer_tag, discount_type, discount_value, is_enabled, starts_at, ends_at, created_at, updated_at)
@@ -1473,7 +1815,7 @@ app.post("/pricing-tiers", async (req, res) => {
   }
 });
 
-app.post("/pricing-tiers/:id/toggle", async (req, res) => {
+app.post("/pricing-tiers/:id/toggle", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1513,7 +1855,7 @@ app.post("/pricing-tiers/:id/toggle", async (req, res) => {
   }
 });
 
-app.post("/pricing-tiers/:id/delete", async (req, res) => {
+app.post("/pricing-tiers/:id/delete", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1550,7 +1892,7 @@ app.post("/pricing-tiers/:id/delete", async (req, res) => {
 });
 
 
-app.get("/customer-assignments", async (req, res) => {
+app.get("/customer-assignments", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1565,6 +1907,8 @@ app.get("/customer-assignments", async (req, res) => {
     const tiers = await getPricingTiers(dashboard.shop.id);
     const assignments = await getCustomerAssignments(dashboard.shop.id);
 
+    const tierCount = tiers.length;
+    const { tierLimit } = getPlanLimits(dashboard.shop.plan_name);
     return res.send(renderCustomerAssignmentsPage({
       shop,
       host,
@@ -1572,6 +1916,8 @@ app.get("/customer-assignments", async (req, res) => {
       dashboard,
       tiers,
       assignments,
+      tierCount,
+      tierLimit,
       prefillEmail: useEmail,
       prefillId: useId
     }));
@@ -1580,7 +1926,7 @@ app.get("/customer-assignments", async (req, res) => {
   }
 });
 
-app.post("/customer-assignments", async (req, res) => {
+app.post("/customer-assignments", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1589,8 +1935,7 @@ app.post("/customer-assignments", async (req, res) => {
     const shopRow = await getShopByDomain(shop);
     if (!shopRow) return res.status(404).send("Shop not found.");
 
-    const dashboard = await getDashboardData(shop);
-    const limit = Number(dashboard?.settings?.free_plan_customer_limit || 1);
+    const { customerLimit: limit } = getPlanLimits(shopRow.plan_name);
 
     const customerEmail = String(req.body.customer_email || "").trim().toLowerCase();
     const shopifyCustomerId = String(req.body.shopify_customer_id || "").trim() || null;
@@ -1629,8 +1974,8 @@ app.post("/customer-assignments", async (req, res) => {
     const currentDistinct = distinctCustomerCount.rows[0].count;
     const isNewCustomer = existingCustomer.rowCount === 0;
 
-    if (isNewCustomer && currentDistinct >= limit) {
-      return res.status(400).send(`Free plan limit reached. This shop can only have ${limit} trade customer(s).`);
+    if (isNewCustomer && limit !== null && currentDistinct >= limit) {
+      return res.status(400).send(`Customer limit reached. Your plan allows ${limit} trade customer(s). Upgrade to unlock more.`);
     }
 
     const insert = await pool.query(
@@ -1643,7 +1988,7 @@ app.post("/customer-assignments", async (req, res) => {
     );
 
     await writeAudit(shopRow.id, "customer_assignment_created", "customer_assignment", insert.rows[0].id, {
-      customer_email: resolvedCustomerEmail,
+      customer_email: customerEmail,
       shopify_customer_id: shopifyCustomerId,
       tier_id: tierId
     });
@@ -1654,7 +1999,7 @@ app.post("/customer-assignments", async (req, res) => {
   }
 });
 
-app.post("/customer-assignments/:id/toggle", async (req, res) => {
+app.post("/customer-assignments/:id/toggle", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1693,7 +2038,7 @@ app.post("/customer-assignments/:id/toggle", async (req, res) => {
   }
 });
 
-app.post("/customer-assignments/:id/delete", async (req, res) => {
+app.post("/customer-assignments/:id/delete", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1725,6 +2070,336 @@ app.post("/customer-assignments/:id/delete", async (req, res) => {
     return res.redirect(getEmbeddedAppUrl(shop, host, "/customer-assignments"));
   } catch (e) {
     return res.status(500).send(`Delete customer assignment failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+
+// --- Customer Product Prices ---
+
+function extractCsvFromMultipart(contentType, buf) {
+  const m = /boundary=([^\s;]+)/i.exec(contentType || '');
+  if (!m) return buf.toString('utf8');
+  const boundary = m[1].replace(/^"(.*)"$/, '$1');
+  const sep = '--' + boundary;
+  const first = buf.indexOf(Buffer.from(sep + '\r\n'));
+  if (first === -1) return buf.toString('utf8');
+  const afterSep = first + sep.length + 2;
+  const headerEnd = buf.indexOf(Buffer.from('\r\n\r\n'), afterSep);
+  if (headerEnd === -1) return '';
+  const bodyStart = headerEnd + 4;
+  const terminator = buf.indexOf(Buffer.from('\r\n--' + boundary), bodyStart);
+  return (terminator === -1 ? buf.slice(bodyStart) : buf.slice(bodyStart, terminator)).toString('utf8');
+}
+
+app.get('/customer-product-prices', requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const dashboard = await getDashboardData(shop);
+    if (!dashboard) return res.status(404).send('Shop not found.');
+    const shopId = dashboard.shop.id;
+    const { skuOverrides, csvImport } = getPlanLimits(dashboard.shop.plan_name);
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = 25;
+    const search = String(req.query.search || '').trim();
+    const offset = (page - 1) * perPage;
+
+    let countQ, rowsQ;
+    if (search) {
+      const like = '%' + search.toLowerCase() + '%';
+      countQ = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM customer_product_prices WHERE shop_id=$1 AND (LOWER(customer_email) LIKE $2 OR LOWER(COALESCE(sku,'')) LIKE $2)`,
+        [shopId, like]
+      );
+      rowsQ = await pool.query(
+        `SELECT id, customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled FROM customer_product_prices WHERE shop_id=$1 AND (LOWER(customer_email) LIKE $2 OR LOWER(COALESCE(sku,'')) LIKE $2) ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`,
+        [shopId, like, perPage, offset]
+      );
+    } else {
+      countQ = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM customer_product_prices WHERE shop_id=$1`, [shopId]
+      );
+      rowsQ = await pool.query(
+        `SELECT id, customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled FROM customer_product_prices WHERE shop_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+        [shopId, perPage, offset]
+      );
+    }
+
+    const totalCount = countQ.rows[0].count;
+    const totalPages = Math.ceil(totalCount / perPage) || 1;
+    const rows = rowsQ.rows;
+    const baseUrl = getEmbeddedAppUrl(shop, host, '/customer-product-prices');
+
+    const tableRows = rows.length === 0
+      ? `<tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">No rows yet.</td></tr>`
+      : rows.map(r => `
+          <tr>
+            <td>${escapeHtml(r.customer_email)}</td>
+            <td>${escapeHtml(r.product_id || '—')}</td>
+            <td>${escapeHtml(r.sku || '—')}</td>
+            <td><strong>£${Number(r.fixed_price).toFixed(2)}</strong></td>
+            <td>${escapeHtml(r.currency || 'GBP')}</td>
+            <td>${escapeHtml(fmtDisplayDate(r.starts_at))}</td>
+            <td>${escapeHtml(fmtDisplayDate(r.ends_at))}</td>
+            <td>
+              <form class="inline-form" method="post" action="/customer-product-prices/${r.id}/delete?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}" onsubmit="return confirm('Delete this price override?');">
+                <button class="btn small danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>`).join('');
+
+    const pagination = totalPages > 1
+      ? `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+          ${page > 1 ? `<a class="btn small" href="${baseUrl}&page=${page - 1}${search ? '&search=' + encodeURIComponent(search) : ''}">Previous</a>` : ''}
+          <span class="muted">Page ${page} of ${totalPages} (${totalCount} rows)</span>
+          ${page < totalPages ? `<a class="btn small" href="${baseUrl}&page=${page + 1}${search ? '&search=' + encodeURIComponent(search) : ''}">Next</a>` : ''}
+        </div>`
+      : `<div class="muted" style="margin-top:8px;font-size:13px;">${totalCount} row${totalCount !== 1 ? 's' : ''}</div>`;
+
+    const importedMsg = req.query.imported ? `<div style="margin-bottom:12px;padding:10px 14px;background:#ecfdf5;border-radius:12px;color:#065f46;font-weight:600;">${escapeHtml(req.query.imported)} row(s) imported${req.query.skipped ? ', ' + escapeHtml(req.query.skipped) + ' skipped' : ''}.</div>` : '';
+
+    const content = `
+      ${renderBrandHero({ shop, host, planName: dashboard.shop.plan_name || 'free', statusText: 'Price Overrides', title: 'Customer Product Prices', subtitle: 'Set fixed prices for specific customers on specific products, overriding tier discounts.', active: 'prices' })}
+      <div class="grid">
+        <div class="stack">
+          <div class="card">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+              <h2 style="margin:0;">Price Overrides</h2>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <a class="btn small" href="${getEmbeddedAppUrl(shop, host, '/customer-product-prices/export.csv')}">Export CSV</a>
+                ${csvImport ? `<button class="btn small primary" onclick="document.getElementById('pg-import-form').style.display='block'">Import CSV</button>` : ''}
+              </div>
+            </div>
+            ${importedMsg}
+            ${csvImport ? `
+            <div id="pg-import-form" style="display:none;margin-bottom:16px;padding:14px;border:1px solid var(--line);border-radius:14px;">
+              <form method="post" action="/customer-product-prices/import?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}" enctype="multipart/form-data">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <input type="file" name="file" accept=".csv,text/csv" required style="flex:1;" />
+                  <button class="btn small primary" type="submit">Upload</button>
+                  <button class="btn small" type="button" onclick="document.getElementById('pg-import-form').style.display='none'">Cancel</button>
+                </div>
+                <div class="muted" style="margin-top:8px;font-size:12px;">CSV columns: customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled</div>
+              </form>
+            </div>` : ''}
+            <form method="get" action="/customer-product-prices" style="margin-bottom:12px;display:flex;gap:8px;">
+              <input type="hidden" name="shop" value="${escapeHtml(shop)}" />
+              ${host ? `<input type="hidden" name="host" value="${escapeHtml(host)}" />` : ''}
+              <input name="search" value="${escapeHtml(search)}" placeholder="Search by email or SKU…" style="flex:1;padding:8px 12px;border:1px solid var(--line);border-radius:12px;" />
+              <button class="btn small" type="submit">Search</button>
+              ${search ? `<a class="btn small" href="${baseUrl}">Clear</a>` : ''}
+            </form>
+            <table>
+              <thead><tr><th>Email</th><th>Product ID</th><th>SKU</th><th>Fixed Price</th><th>Currency</th><th>From</th><th>To</th><th>Actions</th></tr></thead>
+              <tbody>${tableRows}</tbody>
+            </table>
+            ${pagination}
+          </div>
+        </div>
+
+        <div class="stack">
+          ${skuOverrides ? `
+          <div class="card">
+            <h2>Add price override</h2>
+            <form method="post" action="/customer-product-prices?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}">
+              <div class="form-grid">
+                <div class="field full"><label>Customer email</label><input name="customer_email" type="email" placeholder="buyer@example.com" required /></div>
+                <div class="field"><label>Product ID</label><input name="product_id" placeholder="12345678" /></div>
+                <div class="field"><label>SKU</label><input name="sku" placeholder="PROD-001" /></div>
+                <div class="field"><label>Fixed price</label><input name="fixed_price" type="number" step="0.01" min="0" placeholder="19.99" required /></div>
+                <div class="field"><label>Currency</label><input name="currency" placeholder="GBP" value="GBP" /></div>
+                <div class="field"><label>Effective from</label><input name="starts_at" type="datetime-local" /></div>
+                <div class="field"><label>Effective to</label><input name="ends_at" type="datetime-local" /></div>
+                <div class="field full"><label>Status</label><select name="is_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></div>
+              </div>
+              <div class="actions"><button class="btn primary" type="submit">Create override</button><a class="btn" href="${getEmbeddedAppUrl(shop, host, '/')}">Back</a></div>
+            </form>
+          </div>` : `
+          <div class="card">
+            <h2>Growth / Pro feature</h2>
+            <div class="muted">Customer product price overrides require the Growth or Pro plan.</div>
+            <div class="actions" style="margin-top:12px;">
+              <a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=growth">Growth — $9/mo</a>
+              <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Pro — $19/mo</a>
+            </div>
+          </div>`}
+          <div class="card">
+            <h2>How it works</h2>
+            <div class="list">
+              <div class="list-row"><div>Fixed price</div><div class="muted">Overrides tier discount for this customer + product</div></div>
+              <div class="list-row"><div>Date range</div><div class="muted">Optional — leave blank for always-on</div></div>
+              <div class="list-row"><div>CSV import</div><div class="muted">Bulk load prices (Pro plan only)</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    return res.send(renderLayout({ shop, host, apiKey: process.env.SHOPIFY_API_KEY || '', title: 'PriceGuard | Price Overrides', content }));
+  } catch (e) {
+    return res.status(500).send(`Customer product prices load failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.get('/customer-product-prices/export.csv', requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
+
+    const result = await pool.query(
+      `SELECT customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled FROM customer_product_prices WHERE shop_id=$1 ORDER BY created_at DESC, id DESC`,
+      [shopRow.id]
+    );
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="customer_product_prices.csv"');
+    res.write('customer_email,product_id,sku,fixed_price,currency,starts_at,ends_at,is_enabled\n');
+    for (const r of result.rows) {
+      const cols = [r.customer_email, r.product_id || '', r.sku || '', r.fixed_price, r.currency || 'GBP', r.starts_at ? new Date(r.starts_at).toISOString() : '', r.ends_at ? new Date(r.ends_at).toISOString() : '', r.is_enabled ? '1' : '0'];
+      res.write(cols.map(v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"').join(',') + '\n');
+    }
+    res.end();
+  } catch (e) {
+    return res.status(500).send(`Export failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.post('/customer-product-prices', requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
+    if (!getPlanLimits(shopRow.plan_name).skuOverrides) return res.status(403).send('Customer product price overrides require the Growth or Pro plan.');
+
+    const customerEmail = String(req.body.customer_email || '').trim().toLowerCase();
+    const productId = String(req.body.product_id || '').trim() || null;
+    const sku = String(req.body.sku || '').trim() || null;
+    const currency = String(req.body.currency || 'GBP').trim() || 'GBP';
+    const startsAt = String(req.body.starts_at || '').trim() || null;
+    const endsAt = String(req.body.ends_at || '').trim() || null;
+    const isEnabled = String(req.body.is_enabled || 'true') === 'true';
+    const fixedPrice = Number(String(req.body.fixed_price || '').trim());
+
+    if (!customerEmail) return res.status(400).send('Customer email is required.');
+    if (!Number.isFinite(fixedPrice) || fixedPrice < 0) return res.status(400).send('Fixed price must be a valid non-negative number.');
+
+    const ins = await pool.query(
+      `INSERT INTO customer_product_prices (shop_id, customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, NOW(), NOW())
+       RETURNING id`,
+      [shopRow.id, customerEmail, productId, sku, fixedPrice, currency, startsAt, endsAt, isEnabled]
+    );
+    await writeAudit(shopRow.id, 'customer_product_price_created', 'customer_product_price', ins.rows[0].id, { customer_email: customerEmail, product_id: productId, sku, fixed_price: fixedPrice });
+    return res.redirect(getEmbeddedAppUrl(shop, host, '/customer-product-prices'));
+  } catch (e) {
+    return res.status(500).send(`Create customer product price failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.post('/customer-product-prices/import', requireShopSession, express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
+    if (!getPlanLimits(shopRow.plan_name).csvImport) return res.status(403).send('CSV import requires the Pro plan.');
+
+    const contentType = req.get('content-type') || '';
+    let csvText;
+    if (contentType.includes('multipart/form-data')) {
+      csvText = extractCsvFromMultipart(contentType, req.body);
+    } else {
+      csvText = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body || '');
+    }
+
+    const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) return res.status(400).send('CSV must have a header row and at least one data row.');
+
+    const header = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/^"|"$/g, ''));
+    const emailIdx = header.indexOf('customer_email');
+    const productIdx = header.indexOf('product_id');
+    const skuIdx = header.indexOf('sku');
+    const priceIdx = header.indexOf('fixed_price');
+    const currencyIdx = header.indexOf('currency');
+    const startsIdx = header.indexOf('starts_at');
+    const endsIdx = header.indexOf('ends_at');
+    const enabledIdx = header.indexOf('is_enabled');
+
+    if (emailIdx === -1 || priceIdx === -1) return res.status(400).send('CSV must include customer_email and fixed_price columns.');
+
+    let imported = 0;
+    let skipped = 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+        const customerEmail = (cols[emailIdx] || '').toLowerCase().trim();
+        if (!customerEmail) { skipped++; continue; }
+        const fixedPrice = Number(cols[priceIdx] || '');
+        if (!Number.isFinite(fixedPrice) || fixedPrice < 0) { skipped++; continue; }
+        const productId = productIdx !== -1 ? (cols[productIdx] || null) : null;
+        const sku = skuIdx !== -1 ? (cols[skuIdx] || null) : null;
+        const currency = currencyIdx !== -1 ? (cols[currencyIdx] || 'GBP') : 'GBP';
+        const startsAt = startsIdx !== -1 ? (cols[startsIdx] || null) : null;
+        const endsAt = endsIdx !== -1 ? (cols[endsIdx] || null) : null;
+        const rawEnabled = enabledIdx !== -1 ? cols[enabledIdx] : '1';
+        const isEnabled = rawEnabled !== '0' && rawEnabled.toLowerCase() !== 'false';
+
+        if (productId) {
+          await client.query(
+            `DELETE FROM customer_product_prices WHERE shop_id=$1 AND LOWER(customer_email)=$2 AND product_id=$3`,
+            [shopRow.id, customerEmail, productId]
+          );
+        }
+        await client.query(
+          `INSERT INTO customer_product_prices (shop_id, customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, NOW(), NOW())`,
+          [shopRow.id, customerEmail, productId, sku, fixedPrice, currency, startsAt || null, endsAt || null, isEnabled]
+        );
+        imported++;
+      }
+      await client.query('COMMIT');
+    } catch (importErr) {
+      await client.query('ROLLBACK');
+      throw importErr;
+    } finally {
+      client.release();
+    }
+
+    await writeAudit(shopRow.id, 'customer_product_prices_imported', 'customer_product_prices', shopRow.id, { imported, skipped });
+    return res.redirect(getEmbeddedAppUrl(shop, host, '/customer-product-prices') + '&imported=' + imported + '&skipped=' + skipped);
+  } catch (e) {
+    return res.status(500).send(`Import failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.post('/customer-product-prices/:id/delete', requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    const id = Number(req.params.id);
+    if (!shop || !Number.isFinite(id)) return res.status(400).send('Invalid request.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
+
+    const current = await pool.query(
+      `SELECT id, customer_email FROM customer_product_prices WHERE id=$1 AND shop_id=$2 LIMIT 1`,
+      [id, shopRow.id]
+    );
+    if (current.rowCount === 0) return res.status(404).send('Price override not found.');
+
+    await pool.query(`DELETE FROM customer_product_prices WHERE id=$1 AND shop_id=$2`, [id, shopRow.id]);
+    await writeAudit(shopRow.id, 'customer_product_price_deleted', 'customer_product_price', id, { customer_email: current.rows[0].customer_email });
+    return res.redirect(getEmbeddedAppUrl(shop, host, '/customer-product-prices'));
+  } catch (e) {
+    return res.status(500).send(`Delete customer product price failed: ${escapeHtml(e.message)}`);
   }
 });
 
@@ -1831,7 +2506,7 @@ function renderPricingPreviewPage({ shop, host, apiKey, customerEmail = "", prev
 }
 
 
-app.get("/pricing-preview", async (req, res) => {
+app.get("/pricing-preview", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -1873,10 +2548,56 @@ app.post("/webhooks/customers/data_request", express.raw({ type: "application/js
     }
 
     const payload = parseWebhookJsonBody(req);
-    console.log("[SHOPIFY_COMPLIANCE] customers/data_request", {
-      shop: req.get("X-Shopify-Shop-Domain") || "",
-      payload
-    });
+    const shopDomain = req.get("X-Shopify-Shop-Domain") || "";
+    const customerEmail = String(payload.customer?.email || "").trim().toLowerCase();
+    const customerId = String(payload.customer?.id || "");
+    const callbackUrl = String(payload.data_request?.callback_url || "");
+
+    const shopRes = await pool.query(
+      `SELECT id, access_token FROM shops WHERE shop_domain = $1 LIMIT 1`,
+      [shopDomain]
+    );
+
+    if (shopRes.rowCount === 0 || !callbackUrl) {
+      return res.status(200).send("OK");
+    }
+
+    const shop = shopRes.rows[0];
+
+    const [assignmentsRes, pricesRes] = await Promise.all([
+      pool.query(
+        `SELECT id, customer_email, shopify_customer_id, tier_id, starts_at, ends_at, is_enabled, created_at
+         FROM customer_assignments
+         WHERE shop_id = $1
+           AND (LOWER(customer_email) = $2 OR shopify_customer_id = $3)`,
+        [shop.id, customerEmail, customerId]
+      ),
+      pool.query(
+        `SELECT id, customer_email, shopify_customer_id, product_id, variant_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled, created_at
+         FROM customer_product_prices
+         WHERE shop_id = $1
+           AND (LOWER(customer_email) = $2 OR shopify_customer_id = $3)`,
+        [shop.id, customerEmail, customerId]
+      )
+    ]);
+
+    const exportData = {
+      customer: payload.customer,
+      data_request_id: payload.data_request?.id,
+      customer_assignments: assignmentsRes.rows,
+      customer_product_prices: pricesRes.rows
+    };
+
+    if (shop.access_token) {
+      await fetch(callbackUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${shop.access_token}`
+        },
+        body: JSON.stringify(exportData)
+      }).catch((e) => console.error("[GDPR data_request] callback POST failed", e.message));
+    }
 
     return res.status(200).send("OK");
   } catch (err) {
@@ -1892,10 +2613,47 @@ app.post("/webhooks/customers/redact", express.raw({ type: "application/json" })
     }
 
     const payload = parseWebhookJsonBody(req);
-    console.log("[SHOPIFY_COMPLIANCE] customers/redact", {
-      shop: req.get("X-Shopify-Shop-Domain") || "",
-      payload
-    });
+    const shopDomain = req.get("X-Shopify-Shop-Domain") || "";
+    const customerEmail = String(payload.customer?.email || "").trim().toLowerCase();
+    const customerId = String(payload.customer?.id || "");
+
+    const shopRes = await pool.query(
+      `SELECT id FROM shops WHERE shop_domain = $1 LIMIT 1`,
+      [shopDomain]
+    );
+
+    if (shopRes.rowCount === 0) {
+      return res.status(200).send("OK");
+    }
+
+    const shopId = shopRes.rows[0].id;
+
+    const assignmentsDel = await pool.query(
+      `DELETE FROM customer_assignments
+       WHERE shop_id = $1
+         AND (LOWER(customer_email) = $2 OR shopify_customer_id = $3)
+       RETURNING id`,
+      [shopId, customerEmail, customerId]
+    );
+
+    const pricesDel = await pool.query(
+      `DELETE FROM customer_product_prices
+       WHERE shop_id = $1
+         AND (LOWER(customer_email) = $2 OR shopify_customer_id = $3)
+       RETURNING id`,
+      [shopId, customerEmail, customerId]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_logs (shop_id, actor_type, actor_email, action, entity_type, entity_id, metadata_json)
+       VALUES ($1, 'system', 'shopify-gdpr', 'gdpr_customer_redact', 'customer', $2, $3::jsonb)`,
+      [shopId, customerId || customerEmail, JSON.stringify({
+        customer_email: customerEmail,
+        customer_id: customerId,
+        assignments_deleted: assignmentsDel.rowCount,
+        prices_deleted: pricesDel.rowCount
+      })]
+    );
 
     return res.status(200).send("OK");
   } catch (err) {
@@ -1911,10 +2669,38 @@ app.post("/webhooks/shop/redact", express.raw({ type: "application/json" }), asy
     }
 
     const payload = parseWebhookJsonBody(req);
-    console.log("[SHOPIFY_COMPLIANCE] shop/redact", {
-      shop: req.get("X-Shopify-Shop-Domain") || "",
-      payload
-    });
+    const shopDomain = req.get("X-Shopify-Shop-Domain") || String(payload.domain || "");
+
+    const shopRes = await pool.query(
+      `SELECT id FROM shops WHERE shop_domain = $1 LIMIT 1`,
+      [shopDomain]
+    );
+
+    if (shopRes.rowCount === 0) {
+      return res.status(200).send("OK");
+    }
+
+    const shopId = shopRes.rows[0].id;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM audit_logs WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM imports WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM collection_rules WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM customer_product_prices WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM customer_assignments WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM pricing_tiers WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM app_sessions WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM settings WHERE shop_id = $1", [shopId]);
+      await client.query("DELETE FROM shops WHERE id = $1", [shopId]);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
 
     return res.status(200).send("OK");
   } catch (err) {
@@ -1925,24 +2711,32 @@ app.post("/webhooks/shop/redact", express.raw({ type: "application/json" }), asy
 
 
 
-app.post("/webhooks/compliance", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/webhooks/app/uninstalled", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     if (!verifyShopifyWebhookHmac(req)) {
       return res.status(400).send("Invalid webhook signature");
     }
 
-    const payload = parseWebhookJsonBody(req);
-    const topic = req.get("X-Shopify-Topic") || "";
+    const shopDomain = req.get("X-Shopify-Shop-Domain") || "";
+    if (!shopDomain) return res.status(200).send("OK");
 
-    console.log("[SHOPIFY_COMPLIANCE] generic", {
-      topic,
-      shop: req.get("X-Shopify-Shop-Domain") || "",
-      payload
-    });
+    const shopRes = await pool.query(
+      `UPDATE shops
+       SET uninstalled_at = NOW(), access_token = NULL,
+           plan_name = 'free', plan_status = 'inactive', updated_at = NOW()
+       WHERE shop_domain = $1
+       RETURNING id`,
+      [shopDomain]
+    );
+
+    if (shopRes.rowCount > 0) {
+      const shopId = shopRes.rows[0].id;
+      await pool.query("DELETE FROM app_sessions WHERE shop_id = $1", [shopId]);
+    }
 
     return res.status(200).send("OK");
   } catch (err) {
-    console.error("[SHOPIFY_COMPLIANCE] generic failed", err);
+    console.error("[SHOPIFY_WEBHOOK] app/uninstalled failed", err);
     return res.status(200).send("OK");
   }
 });
@@ -2088,7 +2882,59 @@ function isPriceGuardRuleLive(startsAt, endsAt, isEnabled) {
   return true;
 }
 
+async function refreshShopToken(shopDomain) {
+  const shopRes = await pool.query(
+    `SELECT id, refresh_token FROM shops WHERE shop_domain = $1 LIMIT 1`,
+    [shopDomain]
+  );
+  const shop = shopRes.rows[0];
+  if (!shop || !shop.refresh_token) {
+    throw new Error(`No refresh token available for ${shopDomain}`);
+  }
+
+  const res = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_API_KEY,
+      client_secret: process.env.SHOPIFY_API_SECRET,
+      grant_type: "refresh_token",
+      refresh_token: shop.refresh_token
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Token refresh failed: ${res.status} ${text}`);
+  }
+
+  const json = await res.json();
+  const newAccessToken = json.access_token;
+  const newRefreshToken = json.refresh_token || shop.refresh_token;
+  const expiresIn = json.expires_in || 3600;
+  const tokenExpiresAt = new Date(Date.now() + expiresIn * 1000);
+
+  await pool.query(
+    `UPDATE shops SET access_token = $1, refresh_token = $2, token_expires_at = $3, updated_at = NOW() WHERE id = $4`,
+    [newAccessToken, newRefreshToken, tokenExpiresAt, shop.id]
+  );
+
+  return newAccessToken;
+}
+
 async function priceGuardShopifyAdminGraphQL(shopDomain, accessToken, query, variables = {}) {
+  const shopRes = await pool.query(
+    `SELECT token_expires_at FROM shops WHERE shop_domain = $1 LIMIT 1`,
+    [shopDomain]
+  );
+  const shopRow = shopRes.rows[0];
+  if (shopRow && shopRow.token_expires_at) {
+    const expiresAt = new Date(shopRow.token_expires_at);
+    if (expiresAt <= new Date(Date.now() + 5 * 60 * 1000)) {
+      accessToken = await refreshShopToken(shopDomain);
+    }
+  }
+
   const response = await fetch(`https://${shopDomain}/admin/api/2026-04/graphql.json`, {
     method: "POST",
     headers: {
@@ -2204,7 +3050,7 @@ async function resolvePriceGuardAssignment(shop, loggedInCustomerId, customerTag
 
   return {
     assignment: {
-      customer_email: resolvedCustomerEmail || "",
+      customer_email: customerEmail || "",
       shopify_customer_id: String(loggedInCustomerId || ""),
       assignment_starts_at: null,
       assignment_ends_at: null,
@@ -2298,6 +3144,17 @@ app.get("/proxy/price", async (req, res) => {
       });
     }
 
+    const skuPriceRes = await pool.query(
+      `SELECT fixed_price FROM customer_product_prices
+       WHERE shop_id = $1 AND LOWER(customer_email) = LOWER($2) AND product_id = $3
+         AND is_enabled = true
+         AND (starts_at IS NULL OR starts_at <= NOW())
+         AND (ends_at IS NULL OR ends_at >= NOW())
+       ORDER BY id DESC LIMIT 1`,
+      [shop.id, resolvedCustomerEmail || assignment.customer_email || '', productId]
+    );
+    const skuFixedPrice = skuPriceRes.rowCount > 0 ? Number(skuPriceRes.rows[0].fixed_price) : null;
+
     const product = await getPriceGuardProductPricingContext(shop.shop_domain, shop.access_token, productId);
     if (!product) {
       return res.status(404).json({ ok: false, error: "Product not found" });
@@ -2306,11 +3163,9 @@ app.get("/proxy/price", async (req, res) => {
     const firstVariant = product.variants?.nodes?.[0] || null;
     const basePrice = Number(firstVariant?.price || product.priceRangeV2?.minVariantPrice?.amount || 0);
     const compareAt = firstVariant?.compareAtPrice ? Number(firstVariant.compareAtPrice) : null;
-    const finalPrice = calculatePriceGuardDisplayPrice(
-      basePrice,
-      assignment.discount_type,
-      assignment.discount_value
-    );
+    const finalPrice = skuFixedPrice !== null
+      ? skuFixedPrice
+      : calculatePriceGuardDisplayPrice(basePrice, assignment.discount_type, assignment.discount_value);
 
     return res.json({
       ok: true,
@@ -2337,11 +3192,140 @@ app.get("/proxy/price", async (req, res) => {
 });
 
 
+app.get("/proxy/prices", async (req, res) => {
+  try {
+    const query = req.query || {};
+
+    if (!verifyPriceGuardAppProxySignature(query)) {
+      return res.status(400).json({ ok: false, error: "Invalid app proxy signature" });
+    }
+
+    const shopDomain = String(query.shop || "").trim();
+    const loggedInCustomerId = String(query.logged_in_customer_id || "").trim();
+    const customerEmail = String(query.customer_email || "").trim();
+    const customerTags = String(query.customer_tags || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    const productIds = String(query.product_ids || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => /^\d+$/.test(id))
+      .slice(0, 50);
+
+    if (!shopDomain || productIds.length === 0) {
+      return res.status(400).json({ ok: false, error: "Missing shop or product_ids" });
+    }
+
+    if (!loggedInCustomerId) {
+      return res.json({ ok: false, logged_in: false });
+    }
+
+    const shop = await getPriceGuardShopByDomain(shopDomain);
+    if (!shop || !shop.access_token) {
+      return res.status(404).json({ ok: false, error: "Shop not found" });
+    }
+
+    const { assignment } = await resolvePriceGuardAssignment(
+      shop,
+      loggedInCustomerId,
+      customerTags,
+      customerEmail
+    );
+
+    if (!assignment) {
+      const result = {};
+      for (const id of productIds) result[id] = { ok: true, active: false };
+      return res.json(result);
+    }
+
+    const assignmentLive = isPriceGuardRuleLive(
+      assignment.assignment_starts_at,
+      assignment.assignment_ends_at,
+      assignment.assignment_enabled
+    );
+    const tierLive = isPriceGuardRuleLive(
+      assignment.tier_starts_at,
+      assignment.tier_ends_at,
+      assignment.tier_enabled
+    );
+
+    if (!assignmentLive || !tierLive) {
+      const result = {};
+      for (const id of productIds) result[id] = { ok: true, active: false, tier_name: assignment.tier_name };
+      return res.json(result);
+    }
+
+    const resolvedEmail = assignment.customer_email || customerEmail || '';
+    const skuPricesRes = await pool.query(
+      `SELECT product_id, fixed_price FROM customer_product_prices
+       WHERE shop_id = $1 AND LOWER(customer_email) = LOWER($2) AND product_id = ANY($3)
+         AND is_enabled = true
+         AND (starts_at IS NULL OR starts_at <= NOW())
+         AND (ends_at IS NULL OR ends_at >= NOW())`,
+      [shop.id, resolvedEmail, productIds]
+    );
+    const skuPriceMap = {};
+    for (const row of skuPricesRes.rows) skuPriceMap[String(row.product_id)] = Number(row.fixed_price);
+
+    // Single GraphQL query using per-product aliases (p{id} — must start with a letter)
+    const aliasFields = productIds.map((id) => `
+      p${id}: product(id: "gid://shopify/Product/${id}") {
+        id
+        priceRangeV2 {
+          minVariantPrice { amount currencyCode }
+        }
+        variants(first: 1) {
+          nodes { price compareAtPrice }
+        }
+      }`).join("\n");
+
+    const gqlData = await priceGuardShopifyAdminGraphQL(
+      shop.shop_domain,
+      shop.access_token,
+      `#graphql\nquery BulkProductPricing {\n${aliasFields}\n}`,
+      {}
+    );
+
+    const result = {};
+    for (const id of productIds) {
+      const product = gqlData[`p${id}`];
+      if (!product) {
+        result[id] = { ok: false, error: "Product not found" };
+        continue;
+      }
+      const firstVariant = product.variants?.nodes?.[0] || null;
+      const basePrice = Number(firstVariant?.price || product.priceRangeV2?.minVariantPrice?.amount || 0);
+      const currencyCode = product.priceRangeV2?.minVariantPrice?.currencyCode || "GBP";
+      const finalPrice = skuPriceMap[id] !== undefined
+        ? skuPriceMap[id]
+        : calculatePriceGuardDisplayPrice(basePrice, assignment.discount_type, assignment.discount_value);
+      result[id] = {
+        ok: true,
+        active: true,
+        base_price: basePrice,
+        final_price: finalPrice,
+        tier_name: assignment.tier_name,
+        currency_code: currencyCode
+      };
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error("[PRICEGUARD_PROXY_PRICES] failed", err);
+    return res.status(500).json({ ok: false, error: "Bulk price resolution failed" });
+  }
+});
+
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT NOW()");
     res.json({
+      status: "ok",
       ok: true,
+      version: APP_VERSION,
+      timestamp: new Date().toISOString(),
       app: process.env.APP_NAME,
       db: true,
       app_url: process.env.APP_URL || null,
@@ -2378,6 +3362,12 @@ app.get("/install", async (req, res) => {
       state
     });
 
+    oauthStates.set(shop, { state, expiresAt: Date.now() + 600000 });
+
+    res.setHeader(
+      "Set-Cookie",
+      `pg_oauth_state=${encodeURIComponent(makeSignedCookie(state))}; HttpOnly; Secure; SameSite=None; Max-Age=600; Path=/`
+    );
     return res.redirect(installUrl);
   } catch (e) {
     return res.status(500).send(`Install failed: ${escapeHtml(e.message)}`);
@@ -2389,6 +3379,7 @@ app.get("/auth/callback", async (req, res) => {
     const shop = sanitizeShop(req.query.shop);
     const code = String(req.query.code || "");
     const host = String(req.query.host || "");
+    const receivedState = String(req.query.state || "");
 
     if (!shop || !code) {
       return res.status(400).send("Missing shop or code.");
@@ -2398,25 +3389,187 @@ app.get("/auth/callback", async (req, res) => {
       return res.status(400).send("Invalid HMAC.");
     }
 
+    let storedState = null;
+    const mapEntry = oauthStates.get(shop);
+    if (mapEntry && mapEntry.expiresAt > Date.now()) {
+      storedState = mapEntry.state;
+      oauthStates.delete(shop);
+    } else {
+      oauthStates.delete(shop);
+      const rawStateCookie = getCookieValue(req, "pg_oauth_state");
+      storedState = readSignedCookie(rawStateCookie);
+    }
+
+    if (!storedState || !receivedState || storedState !== receivedState) {
+      return res.status(400).send("OAuth state mismatch. Please try installing again.");
+    }
+
     const tokenResponse = await exchangeCodeForToken({ shop, code });
     const accessToken = tokenResponse.access_token;
+    const refreshToken = tokenResponse.refresh_token;
+    const expiresIn = tokenResponse.expires_in;
 
     if (!accessToken) {
       return res.status(500).send("No access token returned by Shopify.");
     }
 
-    await ensureShopAndSettings({
+    const shopRow = await ensureShopAndSettings({
       shopDomain: shop,
-      accessToken
+      accessToken,
+      refreshToken,
+      expiresIn
     });
 
+    if (['growth', 'pro'].includes(shopRow.plan_name)) {
+      let confirmationUrl = null;
+      try {
+        const activeSub = await getActiveSubscription(shop, accessToken);
+        if (!activeSub) {
+          const appUrl = process.env.APP_URL || "https://priceguard.sample-guard.com";
+          const returnUrl = `${appUrl}/billing/callback?shop=${encodeURIComponent(shop)}`;
+          confirmationUrl = await createShopifySubscription(shop, accessToken, returnUrl, shopRow.plan_name);
+        }
+      } catch (billingErr) {
+        console.error("[BILLING] subscription check/create failed:", billingErr.message);
+      }
+
+      if (confirmationUrl) {
+        res.setHeader("Set-Cookie", "pg_oauth_state=; HttpOnly; Secure; SameSite=None; Max-Age=0; Path=/");
+        return res.redirect(confirmationUrl);
+      }
+    }
+
+    const sessionKey = await createAppSession(shopRow.id, shop);
+    const sessionCookieVal = encodeURIComponent(makeSignedCookie(sessionKey));
+    res.setHeader("Set-Cookie", [
+      "pg_oauth_state=; HttpOnly; Secure; SameSite=None; Max-Age=0; Path=/",
+      `pg_session=${sessionCookieVal}; HttpOnly; Secure; SameSite=None; Max-Age=86400; Path=/`
+    ]);
     return res.redirect(getEmbeddedAppUrl(shop, host, "/"));
   } catch (e) {
     return res.status(500).send(`Auth callback failed: ${escapeHtml(e.message)}`);
   }
 });
 
-app.get("/app", async (req, res) => {
+app.post('/dashboard/mark-reviewed', requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
+
+    await pool.query(
+      `UPDATE settings SET reviewed_at = NOW(), updated_at = NOW() WHERE shop_id = $1`,
+      [shopRow.id]
+    );
+
+    const counts = await pool.query(
+      `SELECT
+        (SELECT COUNT(*)::int FROM pricing_tiers WHERE shop_id = $1) AS tiers,
+        (SELECT COUNT(*)::int FROM customer_assignments WHERE shop_id = $1) AS assignments,
+        (SELECT COUNT(*)::int FROM customer_product_prices WHERE shop_id = $1) AS overrides`,
+      [shopRow.id]
+    );
+    const c = counts.rows[0];
+    if (c.tiers > 0 && c.assignments > 0) {
+      await pool.query(
+        `UPDATE settings SET onboarding_complete = true, updated_at = NOW() WHERE shop_id = $1`,
+        [shopRow.id]
+      );
+    }
+
+    await writeAudit(shopRow.id, 'dashboard_reviewed', 'settings', shopRow.id, {});
+    return res.redirect(getEmbeddedAppUrl(shop, host, '/'));
+  } catch (e) {
+    return res.status(500).send(`Mark reviewed failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.get("/billing/callback", async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || "");
+    if (!shop) return res.status(400).send("Invalid shop parameter.");
+
+    if (!verifyHmac(req.query)) {
+      return res.status(400).send("Invalid HMAC.");
+    }
+
+    const shopRes = await pool.query(
+      `SELECT id, access_token FROM shops WHERE shop_domain = $1 LIMIT 1`,
+      [shop]
+    );
+
+    if (shopRes.rowCount === 0 || !shopRes.rows[0].access_token) {
+      return res.status(404).send("Shop not found or not installed.");
+    }
+
+    const shopRow = shopRes.rows[0];
+
+    const activeSub = await getActiveSubscription(shop, shopRow.access_token).catch(() => null);
+
+    if (activeSub) {
+      const subName = activeSub.name || '';
+      const newPlan = subName.includes('Growth') ? 'growth' : 'pro';
+      await pool.query(
+        `UPDATE shops SET plan_name = $1, plan_status = 'active', updated_at = NOW()
+         WHERE id = $2`,
+        [newPlan, shopRow.id]
+      );
+    }
+
+    const sessionKey = await createAppSession(shopRow.id, shop);
+    const sessionCookieVal = encodeURIComponent(makeSignedCookie(sessionKey));
+    res.setHeader(
+      "Set-Cookie",
+      `pg_session=${sessionCookieVal}; HttpOnly; Secure; SameSite=None; Max-Age=86400; Path=/`
+    );
+    return res.redirect(getEmbeddedAppUrl(shop, host, "/"));
+  } catch (e) {
+    return res.status(500).send(`Billing callback failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.get("/billing/upgrade", requireShopSession, async (req, res) => {
+  try {
+    const shop = sanitizeShop(req.query.shop);
+    if (!shop) return res.status(400).send("Missing or invalid shop.");
+    const planName = ['growth', 'pro'].includes(req.query.plan) ? req.query.plan : 'pro';
+
+    const shopRes = await pool.query(
+      `SELECT id, access_token, token_expires_at FROM shops WHERE shop_domain = $1 LIMIT 1`,
+      [shop]
+    );
+
+    if (shopRes.rowCount === 0 || !shopRes.rows[0].access_token) {
+      return res.status(404).send("Shop not found.");
+    }
+
+    const shopRow = shopRes.rows[0];
+    let accessToken = shopRow.access_token;
+    if (shopRow.token_expires_at) {
+      const expiresAt = new Date(shopRow.token_expires_at);
+      if (expiresAt <= new Date(Date.now() + 5 * 60 * 1000)) {
+        accessToken = await refreshShopToken(shop);
+      }
+    }
+
+    const appUrl = process.env.APP_URL || "https://priceguard.sample-guard.com";
+    const returnUrl = `${appUrl}/billing/callback?shop=${encodeURIComponent(shop)}`;
+    const confirmationUrl = await createShopifySubscription(shop, accessToken, returnUrl, planName);
+
+    if (!confirmationUrl) {
+      return res.status(500).send("Failed to create subscription. Please try again.");
+    }
+
+    return res.redirect(confirmationUrl);
+  } catch (e) {
+    return res.status(500).send(`Billing upgrade failed: ${escapeHtml(e.message)}`);
+  }
+});
+
+app.get("/app", requireShopSession, async (req, res) => {
   try {
     const shop = sanitizeShop(req.query.shop);
     const host = String(req.query.host || "");
@@ -2441,136 +3594,364 @@ app.get("/app", async (req, res) => {
   }
 });
 
-app.get("/debug/schema", async (req, res) => {
+app.get("/settings", requireShopSession, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT table_name
-      FROM information_schema.tables
-      WHERE table_schema = 'public'
-      ORDER BY table_name ASC
-    `);
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || "");
+    if (!shop) return res.status(400).send("Missing or invalid shop.");
 
-    res.json({
-      ok: true,
-      tables: result.rows.map(r => r.table_name)
-    });
+    const dashboard = await getDashboardData(shop);
+    if (!dashboard) return res.status(404).send("Shop not found.");
+
+    const planName = escapeHtml(dashboard.shop.plan_name || "free");
+    const planStatus = escapeHtml(dashboard.shop.plan_status || "inactive");
+    const installedAt = dashboard.shop.installed_at
+      ? new Date(dashboard.shop.installed_at).toLocaleDateString("en-GB")
+      : "—";
+
+    const content = `
+      ${renderBrandHero({
+        shop,
+        host,
+        planName: dashboard.shop.plan_name || "free",
+        statusText: "Settings",
+        title: "Settings",
+        subtitle: "Manage your PriceGuard subscription and support options.",
+        active: "settings"
+      })}
+
+      <div class="grid">
+        <div class="stack">
+          <div class="card">
+            <h2>Subscription</h2>
+            <div class="list">
+              <div class="list-row"><div class="muted">Current plan</div><div><strong>${planName}</strong></div></div>
+              <div class="list-row"><div class="muted">Status</div><div>${planStatus}</div></div>
+              ${dashboard.shop.plan_name === 'free' ? `
+              <div class="list-row"><div class="muted">Tier limit</div><div>1 tier</div></div>
+              <div class="list-row"><div class="muted">Customer limit</div><div>1 customer</div></div>` : ''}
+              ${dashboard.shop.plan_name === 'growth' ? `
+              <div class="list-row"><div class="muted">Tier limit</div><div>3 tiers</div></div>
+              <div class="list-row"><div class="muted">Customer limit</div><div>20 customers</div></div>
+              <div class="list-row"><div class="muted">SKU overrides</div><div>Yes</div></div>` : ''}
+              ${dashboard.shop.plan_name === 'pro' ? `
+              <div class="list-row"><div class="muted">Tier limit</div><div>Unlimited</div></div>
+              <div class="list-row"><div class="muted">Customer limit</div><div>Unlimited</div></div>
+              <div class="list-row"><div class="muted">SKU overrides</div><div>Yes</div></div>
+              <div class="list-row"><div class="muted">CSV import</div><div>Yes</div></div>
+              <div class="list-row"><div class="muted">Scheduled pricing</div><div>Yes</div></div>` : ''}
+            </div>
+            <div class="actions" style="margin-top:16px;">
+              ${dashboard.shop.plan_name === 'free' ? `
+              <a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=growth">Growth — $9/mo</a>
+              <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Pro — $19/mo</a>` : ''}
+              ${dashboard.shop.plan_name === 'growth' ? `
+              <a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Upgrade to Pro — $19/mo</a>` : ''}
+              ${dashboard.shop.plan_name === 'pro' ? `
+              <span class="muted" style="font-size:13px;">You're on the Pro plan. To cancel or downgrade, manage your subscription in <a href="https://accounts.shopify.com" target="_blank" style="color:#0b1f55;">Shopify billing</a>.</span>` : ''}
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Support</h2>
+            <div class="list">
+              <div class="list-row">
+                <div class="muted">Email</div>
+                <div><a href="mailto:support@sample-guard.com" style="color:#0b1f55;">support@sample-guard.com</a></div>
+              </div>
+              <div class="list-row">
+                <div class="muted">Privacy policy</div>
+                <div><a href="/privacy" target="_blank" style="color:#0b1f55;">View policy</a></div>
+              </div>
+              <div class="list-row">
+                <div class="muted">Terms of service</div>
+                <div><a href="/terms" target="_blank" style="color:#0b1f55;">View terms</a></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <h2>App info</h2>
+            <div class="list">
+              <div class="list-row"><div class="muted">App</div><div>PriceGuard</div></div>
+              <div class="list-row"><div class="muted">Shop</div><div>${escapeHtml(shop)}</div></div>
+              <div class="list-row"><div class="muted">Installed</div><div>${escapeHtml(installedAt)}</div></div>
+              <div class="list-row"><div class="muted">Pricing tiers</div><div>${dashboard.counts.tiers}</div></div>
+              <div class="list-row"><div class="muted">Customer assignments</div><div>${dashboard.counts.assignments}</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stack" style="margin-top:18px;">
+        <div class="card" style="border-color:#fecaca !important;">
+          <h2 style="color:#991b1b;">Danger zone</h2>
+          <div class="muted" style="margin-bottom:14px;">This will permanently delete all pricing tiers, customer assignments, and price overrides for this shop. The shop record and settings are kept. This cannot be undone.</div>
+          <form method="post" action="/settings/reset?shop=${encodeURIComponent(shop)}${host ? '&host=' + encodeURIComponent(host) : ''}" onsubmit="return document.getElementById('reset-confirm').value === 'RESET';">
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+              <input id="reset-confirm" placeholder='Type RESET to confirm' style="flex:1;padding:10px 14px;border:1px solid #fecaca;border-radius:12px;font-size:14px;" oninput="document.getElementById('reset-btn').disabled=this.value!=='RESET';" />
+              <button id="reset-btn" class="btn danger" type="submit" disabled>Reset all data</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+
+    return res.send(renderLayout({
+      shop,
+      host,
+      apiKey: process.env.SHOPIFY_API_KEY || "",
+      title: "PriceGuard | Settings",
+      content
+    }));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).send(`Settings load failed: ${escapeHtml(e.message)}`);
   }
 });
 
-app.get("/debug/shops", async (req, res) => {
+app.post('/settings/reset', requireShopSession, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT id, shop_domain, plan_name, plan_status, installed_at, created_at, updated_at,
-             CASE WHEN access_token IS NULL THEN false ELSE true END AS has_access_token
-      FROM shops
-      ORDER BY id ASC
-    `);
+    const shop = sanitizeShop(req.query.shop);
+    const host = String(req.query.host || '');
+    if (!shop) return res.status(400).send('Missing or invalid shop.');
+    const shopRow = await getShopByDomain(shop);
+    if (!shopRow) return res.status(404).send('Shop not found.');
 
-    res.json({
-      ok: true,
-      shops: result.rows
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM customer_product_prices WHERE shop_id = $1', [shopRow.id]);
+      await client.query('DELETE FROM customer_assignments WHERE shop_id = $1', [shopRow.id]);
+      await client.query('DELETE FROM pricing_tiers WHERE shop_id = $1', [shopRow.id]);
+      await client.query(
+        `UPDATE settings SET onboarding_complete = false, reviewed_at = NULL, updated_at = NOW() WHERE shop_id = $1`,
+        [shopRow.id]
+      );
+      await client.query('COMMIT');
+    } catch (e2) {
+      await client.query('ROLLBACK');
+      throw e2;
+    } finally {
+      client.release();
+    }
+
+    await writeAudit(shopRow.id, 'settings_reset', 'shop', shopRow.id, { shop_domain: shop });
+    return res.redirect(getEmbeddedAppUrl(shop, host, '/'));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).send(`Reset failed: ${escapeHtml(e.message)}`);
   }
 });
 
-
+const LEGAL_PAGE_STYLE = `
+<style>
+body{margin:0;background:#f4f6f8;color:#111827;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+.wrap{max-width:860px;margin:40px auto;padding:0 20px 60px;}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:24px;padding:36px 40px;box-shadow:0 10px 30px rgba(15,23,42,.06);}
+h1{margin:0 0 8px;font-size:32px;color:#0f172a;}
+h2{margin:32px 0 10px;font-size:20px;color:#0f172a;border-top:1px solid #f1f5f9;padding-top:24px;}
+p,li{color:#4b5563;line-height:1.7;margin:0 0 10px;}
+ul{padding-left:20px;margin:0 0 10px;}
+.small{color:#6b7280;font-size:14px;margin-bottom:20px;}
+a{color:#0b1f55;}
+.footer{margin-top:28px;padding-top:20px;border-top:1px solid #f1f5f9;font-size:13px;color:#9ca3af;display:flex;gap:16px;flex-wrap:wrap;}
+</style>`;
 
 app.get('/privacy', (req, res) => {
-  res.send(`
-<!doctype html>
+  res.send(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PriceGuard Privacy Policy</title>
-<style>
-body{
-  margin:0;
-  background:#f4f6f8;
-  color:#111827;
-  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-}
-.wrap{
-  max-width:900px;
-  margin:40px auto;
-  padding:0 20px;
-}
-.card{
-  background:#fff;
-  border:1px solid #e5e7eb;
-  border-radius:24px;
-  padding:32px;
-  box-shadow:0 10px 30px rgba(15,23,42,.06);
-}
-h1{
-  margin:0 0 10px;
-  font-size:34px;
-}
-h2{
-  margin:28px 0 10px;
-  font-size:22px;
-}
-p,li{
-  color:#4b5563;
-  line-height:1.65;
-}
-.small{
-  color:#6b7280;
-  font-size:14px;
-}
-a{
-  color:#0b1f55;
-  text-decoration:none;
-}
-</style>
+<title>PriceGuard — Privacy Policy</title>
+${LEGAL_PAGE_STYLE}
 </head>
 <body>
 <div class="wrap">
 <div class="card">
 <h1>Privacy Policy</h1>
-<p class="small">Last updated: 2026-04-21</p>
+<p class="small">Last updated: 23 April 2026</p>
 
-<p>PriceGuard respects your privacy and is committed to protecting merchant data.</p>
+<p>PriceGuard ("we", "us") is a Shopify app that provides customer-specific pricing tools for merchants. This policy explains what data we collect, how we use it, and your rights under applicable data protection law including the UK GDPR and EU GDPR.</p>
 
-<h2>Information We Collect</h2>
+<h2>Data We Collect</h2>
 <ul>
-<li>Store information required to install and operate the app</li>
-<li>Configuration data such as pricing tiers and customer assignments</li>
-<li>Limited technical logs used for security, support and troubleshooting</li>
+<li><strong>Shop domain and OAuth access token</strong> — required to authenticate with the Shopify Admin API and operate the app.</li>
+<li><strong>Customer email addresses</strong> — entered by merchants to assign customers to pricing tiers. We do not collect these from Shopify; merchants enter them manually.</li>
+<li><strong>Shopify customer IDs</strong> — optionally provided by merchants alongside email addresses.</li>
+<li><strong>Pricing configuration data</strong> — pricing tiers, discount values, date ranges, and SKU-level fixed prices set by merchants.</li>
+<li><strong>Audit log entries</strong> — timestamped records of changes made in the app, used for support and troubleshooting.</li>
+<li><strong>Session tokens</strong> — short-lived tokens (24 hours) stored server-side to maintain the embedded app session.</li>
 </ul>
 
-<h2>How We Use Information</h2>
+<h2>How We Use Data</h2>
 <ul>
-<li>Provide customer pricing functionality inside Shopify</li>
-<li>Maintain app security and reliability</li>
-<li>Respond to support requests</li>
-<li>Improve the app experience</li>
+<li>Deliver the core app functionality: displaying trade prices to logged-in customers on your storefront.</li>
+<li>Authenticate and maintain your merchant session inside the Shopify admin.</li>
+<li>Respond to GDPR data access and deletion requests from Shopify.</li>
+<li>Investigate support requests and diagnose technical issues.</li>
 </ul>
 
 <h2>Data Sharing</h2>
-<p>We do not sell merchant data. Data is only shared with service providers required to operate the app or where required by law.</p>
+<p>We do not sell, rent, or share merchant or customer data with third parties for marketing purposes. Data may be shared only:</p>
+<ul>
+<li>With infrastructure providers (database hosting) under appropriate data processing agreements.</li>
+<li>Where required by law or to comply with a valid legal obligation.</li>
+</ul>
+
+<h2>GDPR Compliance</h2>
+<p>We support Shopify's mandatory GDPR webhooks:</p>
+<ul>
+<li><strong>Customer data request</strong> — we return all pricing assignments and product prices linked to the customer.</li>
+<li><strong>Customer redact</strong> — we permanently delete all pricing data linked to the customer within 30 days of the request.</li>
+<li><strong>Shop redact</strong> — we permanently delete all shop data within 30 days of app uninstallation.</li>
+</ul>
+<p>The lawful basis for processing merchant data is the performance of a contract (providing the app service). Customer email addresses are processed on behalf of merchants under their own lawful basis as data controllers.</p>
 
 <h2>Data Retention</h2>
-<p>We retain data only as long as necessary to provide the service and meet legal obligations.</p>
+<p>Merchant data is retained for as long as the app is installed. Following uninstallation, data is deleted within 30 days in response to Shopify's shop/redact webhook. Session tokens expire after 24 hours and are purged automatically.</p>
 
 <h2>Security</h2>
-<p>We use reasonable technical and organisational measures to protect data.</p>
+<p>All data is transmitted over HTTPS. Access tokens are stored encrypted at rest. Webhook payloads are verified using HMAC-SHA256 signatures. We implement session signing to prevent tampering.</p>
 
 <h2>Your Rights</h2>
-<p>You may request access, correction or deletion of your data where applicable.</p>
+<p>Under UK/EU GDPR, you have the right to access, correct, or request deletion of personal data we hold. To exercise these rights, or to raise a data protection concern, please contact us.</p>
 
 <h2>Contact</h2>
-<p>Email: <a href="mailto:contact@sample-guard.com">contact@sample-guard.com</a></p>
+<p>Email: <a href="mailto:support@sample-guard.com">support@sample-guard.com</a></p>
 
+<div class="footer">
+  <a href="/terms">Terms of Service</a>
+  <span>&middot;</span>
+  <a href="/privacy">Privacy Policy</a>
+</div>
 </div>
 </div>
 </body>
-</html>
-`);
+</html>`);
+});
+
+app.get('/terms', (req, res) => {
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PriceGuard — Terms of Service</title>
+${LEGAL_PAGE_STYLE}
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<h1>Terms of Service</h1>
+<p class="small">Last updated: 23 April 2026</p>
+
+<p>These Terms of Service ("Terms") govern your access to and use of the PriceGuard Shopify app ("App", "Service"). By installing or using PriceGuard you agree to these Terms.</p>
+
+<h2>1. The Service</h2>
+<p>PriceGuard is a Shopify embedded app that allows merchants to create customer-specific pricing tiers and display trade prices on their storefront. The App is provided as a subscription service through the Shopify App Store.</p>
+
+<h2>2. Eligibility</h2>
+<p>You must have a valid Shopify store and agree to Shopify's Partner Program terms to install the App. You must be at least 18 years old and have authority to enter into these Terms on behalf of your business.</p>
+
+<h2>3. Subscription and Billing</h2>
+<p>PriceGuard offers three plans:</p>
+<ul>
+<li><strong>Free</strong> — 1 pricing tier, 1 trade customer. No charge.</li>
+<li><strong>Growth</strong> — $9/month. 3 tiers, 20 customers, SKU-level price overrides.</li>
+<li><strong>Pro</strong> — $19/month. Unlimited tiers and customers, SKU overrides, CSV import, and scheduled pricing.</li>
+</ul>
+<p>Billing for the Growth and Pro plans is handled by Shopify through the App Store. Charges appear on your Shopify invoice. A 14-day free trial applies to new Growth and Pro subscriptions. You may cancel at any time; cancellation takes effect at the end of the current billing cycle. On cancellation or uninstallation, your account reverts to the Free plan.</p>
+
+<h2>4. Acceptable Use</h2>
+<p>You agree not to:</p>
+<ul>
+<li>Use the App for any unlawful purpose or in violation of Shopify's Terms of Service.</li>
+<li>Attempt to reverse-engineer, decompile, or extract the source code of the App.</li>
+<li>Use the App to store or transmit malicious code.</li>
+<li>Resell or sublicense the App without written permission.</li>
+</ul>
+
+<h2>5. Data and Privacy</h2>
+<p>Your use of the App is subject to our <a href="/privacy">Privacy Policy</a>. You are responsible for ensuring you have a lawful basis to share customer email addresses with PriceGuard as part of your own GDPR obligations.</p>
+
+<h2>6. Intellectual Property</h2>
+<p>The App and all related materials are owned by PriceGuard and protected by copyright and other intellectual property laws. These Terms do not transfer any ownership rights to you.</p>
+
+<h2>7. Disclaimers</h2>
+<p>The App is provided "as is" without warranty of any kind, express or implied. We do not warrant that the App will be error-free, uninterrupted, or meet your specific requirements. Pricing display depends on your Shopify theme and extension configuration.</p>
+
+<h2>8. Limitation of Liability</h2>
+<p>To the maximum extent permitted by law, PriceGuard shall not be liable for any indirect, incidental, special, or consequential damages arising from your use of the App, including loss of revenue or data. Our total liability shall not exceed the fees paid by you in the 3 months prior to the event giving rise to the claim.</p>
+
+<h2>9. Termination</h2>
+<p>We may suspend or terminate your access to the App at our discretion if you breach these Terms. You may terminate by uninstalling the App from your Shopify store at any time.</p>
+
+<h2>10. Changes to Terms</h2>
+<p>We may update these Terms from time to time. Continued use of the App after changes are posted constitutes acceptance of the revised Terms. Material changes will be notified via the App or email.</p>
+
+<h2>11. Governing Law</h2>
+<p>These Terms are governed by the laws of England and Wales. Any disputes shall be subject to the exclusive jurisdiction of the courts of England and Wales.</p>
+
+<h2>12. Contact</h2>
+<p>Email: <a href="mailto:support@sample-guard.com">support@sample-guard.com</a></p>
+
+<div class="footer">
+  <a href="/privacy">Privacy Policy</a>
+  <span>&middot;</span>
+  <a href="/terms">Terms of Service</a>
+</div>
+</div>
+</div>
+</body>
+</html>`);
+});
+
+app.get('/support', (req, res) => {
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PriceGuard — Support</title>
+${LEGAL_PAGE_STYLE}
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<h1>Support</h1>
+<p class="small">PriceGuard — Customer pricing for Shopify</p>
+
+<p>We're here to help. If you have a question, run into an issue, or need help getting set up, please reach out via email and we'll get back to you as soon as possible.</p>
+
+<h2>Contact Us</h2>
+<p>Email: <a href="mailto:support@sample-guard.com">support@sample-guard.com</a></p>
+<p>We aim to respond to all support requests within one business day.</p>
+
+<h2>Common Questions</h2>
+<p><strong>How do I create a pricing tier?</strong><br>
+Go to the Pricing Tiers page inside the app and fill in the tier name, discount type (percentage or fixed amount), and an optional date range.</p>
+
+<p><strong>How do I assign a customer?</strong><br>
+Go to Customer Assignments and enter the customer's email address. Free plan supports 1 customer; upgrade to Premium for unlimited.</p>
+
+<p><strong>Prices aren't showing on my storefront.</strong><br>
+Make sure the PriceGuard theme extension is enabled in your Shopify theme editor. Navigate to Online Store → Themes → Customize, and add the PriceGuard block to your product page template.</p>
+
+<p><strong>How do I upgrade to Premium?</strong><br>
+Click "Upgrade to Premium" on the dashboard or visit the Billing page inside the app. Premium includes unlimited tiers, customers, and SKU-level price overrides.</p>
+
+<h2>Legal</h2>
+<div class="footer">
+  <a href="/privacy">Privacy Policy</a>
+  <span>&middot;</span>
+  <a href="/terms">Terms of Service</a>
+</div>
+</div>
+</div>
+</body>
+</html>`);
 });
 
 app.listen(port, () => {

@@ -3,8 +3,8 @@
 
   const PG = window.PriceGuard;
   const proxyBase = PG.proxyBase;
-  let lastAppliedSignature = "";
   let inFlight = false;
+  let priceObserver = null;
 
   function log(...args) {
     if (PG.debug) console.log("[PriceGuard]", ...args);
@@ -122,43 +122,24 @@
     return strong || candidates[0];
   }
 
-  function ensureWrapper(node) {
-    let wrap = document.querySelector(".priceguard-price-wrap");
-    if (wrap && wrap.contains(node)) return wrap;
+  // Watch the wrapper's parent. If the theme tears out our wrapper or removes
+  // our injected price element, re-apply immediately using the cached data.
+  function observePriceNode(wrap, data) {
+    if (priceObserver) priceObserver.disconnect();
+    const parent = wrap.parentNode;
+    if (!parent) return;
 
-    wrap = document.createElement("div");
-    wrap.className = "priceguard-price-wrap";
+    priceObserver = new MutationObserver(() => {
+      const wrapGone = !parent.contains(wrap);
+      const priceElGone = !wrap.querySelector(".priceguard-final-price");
+      if (wrapGone || priceElGone) {
+        priceObserver.disconnect();
+        priceObserver = null;
+        setTimeout(() => applyResolvedPrice(data), 50);
+      }
+    });
 
-    node.parentNode.insertBefore(wrap, node);
-    wrap.appendChild(node);
-
-    return wrap;
-  }
-
-  function ensureOriginalNode(wrap, originalText) {
-    let el = wrap.querySelector(".priceguard-original-price");
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "priceguard-original-price";
-      wrap.appendChild(el);
-    }
-    el.textContent = originalText;
-    return el;
-  }
-
-  function ensureBadgeNode(wrap, tierName) {
-    let el = wrap.querySelector(".priceguard-tier-badge");
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "priceguard-tier-badge";
-      wrap.appendChild(el);
-    }
-    el.textContent = `${tierName} price`;
-    return el;
-  }
-
-  function removeInjectedNodes() {
-    document.querySelectorAll(".priceguard-original-price, .priceguard-tier-badge").forEach((n) => n.remove());
+    priceObserver.observe(parent, { childList: true, subtree: true });
   }
 
   function applyResolvedPrice(data) {
@@ -173,14 +154,16 @@
       return;
     }
 
-    const originalText = formatMoney(data.base_price, data.currency_code);
-    const finalText = formatMoney(data.final_price, data.currency_code);
     const signature = `${data.product_id}:${data.final_price}:${data.tier_name}`;
 
-    if (lastAppliedSignature === signature) {
-      log("Price already applied");
+    // Idempotency: if our wrapper already carries this exact signature, nothing to do.
+    const existingWrap = node.closest("[data-priceguard-applied]");
+    if (existingWrap && existingWrap.dataset.priceguardApplied === signature) {
+      log("Price already applied (idempotent)");
       return;
     }
+
+    const finalText = formatMoney(data.final_price, data.currency_code);
 
     log("Applying price", {
       productId: data.product_id,
@@ -190,27 +173,51 @@
       nodeTextBefore: normalizeText(node.textContent)
     });
 
-    const wrap = ensureWrapper(node);
+    // Build or reuse wrapper — a single span that contains the original node
+    // plus our injected elements. We never modify the original node's text so
+    // the theme can keep writing to it without stomping our display.
+    let wrap = node.closest(".priceguard-price-wrap");
+    if (!wrap) {
+      wrap = document.createElement("span");
+      wrap.className = "priceguard-price-wrap";
+      node.parentNode.insertBefore(wrap, node);
+      wrap.appendChild(node);
+    }
+    wrap.dataset.priceguardApplied = signature;
 
+    // Style the original element as struck-through when prices differ.
+    // No textContent mutation — the theme owns that node.
     if (data.base_price !== data.final_price) {
-      ensureOriginalNode(wrap, originalText);
+      node.classList.add("priceguard-original-price");
     } else {
-      const old = wrap.querySelector(".priceguard-original-price");
-      if (old) old.remove();
+      node.classList.remove("priceguard-original-price");
     }
 
-    ensureBadgeNode(wrap, data.tier_name);
+    // Inject or update the custom price element (sibling to the original node).
+    let customEl = wrap.querySelector(".priceguard-final-price");
+    if (!customEl) {
+      customEl = document.createElement("span");
+      customEl.className = "priceguard-final-price";
+      node.insertAdjacentElement("afterend", customEl);
+    }
+    customEl.textContent = finalText;
 
-    node.classList.add("priceguard-final-price");
-    node.textContent = finalText;
+    // Inject or update the tier badge.
+    let badgeEl = wrap.querySelector(".priceguard-tier-badge");
+    if (!badgeEl) {
+      badgeEl = document.createElement("span");
+      badgeEl.className = "priceguard-tier-badge";
+      customEl.insertAdjacentElement("afterend", badgeEl);
+    }
+    badgeEl.textContent = `${data.tier_name} price`;
 
-    lastAppliedSignature = signature;
+    observePriceNode(wrap, data);
   }
 
   async function fetchResolvedPrice(productId) {
     const tags = Array.isArray(PG.customerTags) ? PG.customerTags.join(",") : "";
     const email = PG.customerEmail || "";
-    const url = `${proxyBase}?product_id=${encodeURIComponent(productId)}&customer_email=${encodeURIComponent(email)}&customer_tags=${encodeURIComponent(tags)}`;
+    const url = `${proxyBase}?product_id=${encodeURIComponent(productId)}&logged_in_customer_id=${encodeURIComponent(PG.customerId || "")}&customer_email=${encodeURIComponent(email)}&customer_tags=${encodeURIComponent(tags)}`;
     const res = await fetch(url, {
       credentials: "same-origin",
       headers: { Accept: "application/json" }
@@ -271,22 +278,24 @@
       setTimeout(() => refreshPrice("section load"), 200);
     });
 
-    const observer = new MutationObserver(() => {
+    // Broad fallback: if our injected price element disappears and the targeted
+    // observer hasn't caught it yet (e.g. during a full section re-render),
+    // queue a fresh fetch.
+    const broadObserver = new MutationObserver(() => {
       const node = chooseMainPriceNode();
       if (!node) return;
-      if (!document.querySelector(".priceguard-tier-badge")) {
+      if (!document.querySelector(".priceguard-final-price")) {
         setTimeout(() => refreshPrice("mutation observer"), 100);
       }
     });
 
-    observer.observe(document.body, {
+    broadObserver.observe(document.body, {
       childList: true,
       subtree: true
     });
   }
 
   function init() {
-    removeInjectedNodes();
     refreshPrice("init");
     wireVariantListeners();
   }

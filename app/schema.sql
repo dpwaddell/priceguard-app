@@ -2,6 +2,8 @@ CREATE TABLE IF NOT EXISTS shops (
   id BIGSERIAL PRIMARY KEY,
   shop_domain TEXT NOT NULL UNIQUE,
   access_token TEXT,
+  refresh_token TEXT,
+  token_expires_at TIMESTAMPTZ,
   installed_at TIMESTAMPTZ,
   uninstalled_at TIMESTAMPTZ,
   plan_name TEXT DEFAULT 'free',
@@ -11,6 +13,9 @@ CREATE TABLE IF NOT EXISTS shops (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE shops ADD COLUMN IF NOT EXISTS refresh_token TEXT;
+ALTER TABLE shops ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS settings (
   id BIGSERIAL PRIMARY KEY,
