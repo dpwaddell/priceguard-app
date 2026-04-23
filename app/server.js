@@ -1228,7 +1228,7 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
         ${dashboard.shop.plan_name === 'free' ? `<div style="padding:16px 18px;background:linear-gradient(135deg,#0b1f55,#1a3a8a);border-radius:18px;color:#fff;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
           <div>
             <div style="font-weight:700;font-size:15px;margin-bottom:4px;">You're on the Free plan — 1 tier, 1 customer.</div>
-            <div style="font-size:13px;opacity:0.85;">Upgrade to Growth ($9/mo) for 3 tiers and 20 customers, or Pro ($19/mo) for unlimited.</div>
+            <div style="font-size:13px;opacity:0.85;">Upgrade to Growth ($9/mo) for 3 tiers, 20 customers, and sitewide pricing — or Pro ($19/mo) for unlimited.</div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=growth" style="background:rgba(255,255,255,0.15);color:#fff;font-weight:700;padding:10px 16px;border-radius:12px;text-decoration:none;font-size:14px;white-space:nowrap;border:1px solid rgba(255,255,255,0.3);">Growth — $9/mo</a>
@@ -2776,7 +2776,7 @@ function verifyPriceGuardAppProxySignature(query) {
 
 async function getPriceGuardShopByDomain(shopDomain) {
   const res = await pool.query(
-    `SELECT id, shop_domain, access_token
+    `SELECT id, shop_domain, access_token, plan_name
      FROM shops
      WHERE shop_domain = $1
      LIMIT 1`,
@@ -3225,6 +3225,12 @@ app.get("/proxy/prices", async (req, res) => {
     const shop = await getPriceGuardShopByDomain(shopDomain);
     if (!shop || !shop.access_token) {
       return res.status(404).json({ ok: false, error: "Shop not found" });
+    }
+
+    if (!getPlanLimits(shop.plan_name).skuOverrides) {
+      const result = {};
+      for (const id of productIds) result[id] = { ok: false, active: false, reason: "sitewide_plan_required" };
+      return res.json(result);
     }
 
     const { assignment } = await resolvePriceGuardAssignment(

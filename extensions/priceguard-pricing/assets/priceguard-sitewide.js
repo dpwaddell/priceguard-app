@@ -224,6 +224,7 @@
       if (!priceMap || priceMap.ok === false) return;
 
       for (const [productId, data] of Object.entries(priceMap)) {
+        // active:false covers both "no assignment" and plan-gated responses (reason:'sitewide_plan_required')
         if (!data || !data.active) continue;
         const priceNodes = findPriceNodesForProduct(productId);
         log(`Product ${productId}: ${priceNodes.length} price node(s) found`);
