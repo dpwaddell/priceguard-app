@@ -89,8 +89,8 @@ async function shopifyAdminGraphQL(shopDomain, accessToken, query, variables = {
 
 async function createShopifySubscription(shopDomain, accessToken, returnUrl, planName = 'pro') {
   const PLAN_CONFIG = {
-    growth: { name: 'PriceGuard Growth', price: 9.00 },
-    pro:    { name: 'PriceGuard Pro',    price: 19.00 }
+    growth: { name: 'PriceGuard Growth', price: 9.99 },
+    pro:    { name: 'PriceGuard Pro',    price: 19.99 }
   };
   const plan = PLAN_CONFIG[planName] || PLAN_CONFIG.pro;
 
