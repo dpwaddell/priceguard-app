@@ -1155,7 +1155,7 @@ function renderNav(shop, host, active) {
       <button type="button" class="btn ${active === "assignments" ? "primary" : ""}" onclick="window.location.href='${assignmentsUrl}'">Customer Assignments</button>
       <button type="button" class="btn ${active === "prices" ? "primary" : ""}" onclick="window.location.href='${pricesUrl}'">Price Overrides</button>
       <button type="button" class="btn ${active === "preview" ? "primary" : ""}" onclick="window.location.href='${previewUrl}'">Pricing Preview</button>
-      <a class="btn" href="mailto:support@sample-guard.com" style="text-decoration:none;">Support</a>
+      <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/support')}" onclick="event.preventDefault(); window.open('https://priceguard.sample-guard.com/support','_blank')" style="text-decoration:none;">Support</a>
     </div>
   `;
 }
@@ -1292,6 +1292,35 @@ function renderDashboard({ shop, apiKey, dashboard, host }) {
           </div>
           <div style="margin-top:14px;font-size:13px;color:#9ca3af;">
             Questions? Email <a href="mailto:support@sample-guard.com" style="color:#0b1f55;">support@sample-guard.com</a>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Enable Theme Extension</h2>
+          <div class="list">
+            <div class="list-row">
+              <div><strong>Step 1</strong></div>
+              <div class="muted">In your Shopify admin, go to <strong>Online Store → Themes</strong></div>
+            </div>
+            <div class="list-row">
+              <div><strong>Step 2</strong></div>
+              <div class="muted">Click <strong>Customize</strong> on your active theme</div>
+            </div>
+            <div class="list-row">
+              <div><strong>Step 3</strong></div>
+              <div class="muted">In the theme editor, click <strong>Add section</strong> or <strong>Add block</strong></div>
+            </div>
+            <div class="list-row">
+              <div><strong>Step 4</strong></div>
+              <div class="muted">Search for <strong>PriceGuard</strong> and add the block to your product page template</div>
+            </div>
+            <div class="list-row">
+              <div><strong>Step 5</strong></div>
+              <div class="muted">For sitewide pricing (Growth/Pro), also enable the PriceGuard embed in <strong>Theme Settings → App Embeds</strong></div>
+            </div>
+          </div>
+          <div style="margin-top:14px;">
+            <a href="https://${escapeHtml(shop)}/admin/themes/current/editor" target="_blank" style="color:#0b1f55;font-weight:700;font-size:13px;">Open Theme Editor →</a>
           </div>
         </div>
       </div>
@@ -2183,9 +2212,7 @@ app.get('/customer-product-prices', requireShopSession, async (req, res) => {
                 <div class="muted" style="margin-top:8px;font-size:12px;">CSV columns: customer_email, product_id, sku, fixed_price, currency, starts_at, ends_at, is_enabled</div>
               </form>
             </div>` : ''}
-            <form method="get" action="/customer-product-prices" style="margin-bottom:12px;display:flex;gap:8px;">
-              <input type="hidden" name="shop" value="${escapeHtml(shop)}" />
-              ${host ? `<input type="hidden" name="host" value="${escapeHtml(host)}" />` : ''}
+            <form style="margin-bottom:12px;display:flex;gap:8px;" onsubmit="event.preventDefault(); window.location.href='${baseUrl}&search=' + encodeURIComponent(this.querySelector('[name=search]').value);">
               <input name="search" value="${escapeHtml(search)}" placeholder="Search by email or SKU…" style="flex:1;padding:8px 12px;border:1px solid var(--line);border-radius:12px;" />
               <button class="btn small" type="submit">Search</button>
               ${search ? `<a class="btn small" href="${baseUrl}">Clear</a>` : ''}
