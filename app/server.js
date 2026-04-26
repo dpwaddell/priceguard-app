@@ -1070,11 +1070,17 @@ function renderLayout({ shop, host, apiKey, title, content }) {
     <script>
       const host = new URLSearchParams(window.location.search).get("host");
       if (host && window.shopify && window.shopify.createApp) {
-        window.shopify.createApp({
+        const app = window.shopify.createApp({
           apiKey: "${apiKeySafe}",
           host,
           forceRedirect: true
         });
+        app.getState().then(function(state) {
+          const token = state && state.token;
+          if (token) {
+            sessionStorage.setItem('pg_session_token', token);
+          }
+        }).catch(function() {});
       }
     </script>
     <div style="margin-top:32px;padding:16px 0 8px;border-top:1px solid #e5e7eb;text-align:center;font-size:13px;color:#9ca3af;">
@@ -1659,6 +1665,38 @@ function renderCustomerAssignmentsPage({ shop, host, apiKey, dashboard, tiers, a
 
 // --- Cookie and session helpers ---
 
+function verifySessionToken(token, shopifyApiSecret) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+
+    const [headerB64, payloadB64, sigB64] = parts;
+    const signingInput = `${headerB64}.${payloadB64}`;
+
+    const expected = crypto
+      .createHmac("sha256", shopifyApiSecret)
+      .update(signingInput)
+      .digest("base64url");
+
+    const sigBuf = Buffer.from(sigB64, "base64url");
+    const expBuf = Buffer.from(expected, "base64url");
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+
+    if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+
+    const dest = String(payload.dest || "");
+    if (!dest.includes(".myshopify.com")) return null;
+
+    const shop = dest.replace(/^https?:\/\//, "").replace(/\/$/, "");
+    const userId = String(payload.sub || "");
+    return { shop, userId };
+  } catch {
+    return null;
+  }
+}
+
 function getCookieValue(req, name) {
   const header = req.headers.cookie || "";
   for (const part of header.split(";")) {
@@ -1715,37 +1753,43 @@ async function requireShopSession(req, res, next) {
 
   const raw = getCookieValue(req, "pg_session");
   const sessionKey = readSignedCookie(raw);
-  if (!sessionKey) return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
 
-  try {
-    const result = await pool.query(
-      `SELECT s.expires_at, sh.shop_domain
-       FROM app_sessions s
-       JOIN shops sh ON sh.id = s.shop_id
-       WHERE s.session_key = $1
-       LIMIT 1`,
-      [sessionKey]
-    );
+  if (sessionKey) {
+    try {
+      const result = await pool.query(
+        `SELECT s.expires_at, sh.shop_domain
+         FROM app_sessions s
+         JOIN shops sh ON sh.id = s.shop_id
+         WHERE s.session_key = $1
+         LIMIT 1`,
+        [sessionKey]
+      );
 
-    if (result.rowCount === 0) {
-      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+      if (result.rowCount > 0) {
+        const row = result.rows[0];
+        if (new Date(row.expires_at) >= new Date() && row.shop_domain === shop) {
+          return next();
+        }
+        if (new Date(row.expires_at) < new Date()) {
+          await pool.query("DELETE FROM app_sessions WHERE session_key = $1", [sessionKey]);
+        }
+      }
+    } catch {
+      return res.status(500).send("Session verification failed. Please try again.");
     }
-
-    const row = result.rows[0];
-
-    if (new Date(row.expires_at) < new Date()) {
-      await pool.query("DELETE FROM app_sessions WHERE session_key = $1", [sessionKey]);
-      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
-    }
-
-    if (row.shop_domain !== shop) {
-      return res.status(403).send("Session shop mismatch.");
-    }
-
-    return next();
-  } catch {
-    return res.status(500).send("Session verification failed. Please try again.");
   }
+
+  const authHeader = req.headers.authorization || "";
+  if (authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    const apiSecret = process.env.SHOPIFY_API_SECRET || "";
+    const verified = verifySessionToken(token, apiSecret);
+    if (verified && verified.shop === shop) {
+      return next();
+    }
+  }
+
+  return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
 }
 
 async function requireShopSessionIfShop(req, res, next) {
@@ -3631,6 +3675,20 @@ app.get("/proxy/prices", async (req, res) => {
     console.error("[PRICEGUARD_PROXY_PRICES] failed", err);
     return res.status(500).json({ ok: false, error: "Bulk price resolution failed" });
   }
+});
+
+app.get("/api/session-token", (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ valid: false, error: "Missing Bearer token" });
+  }
+  const token = authHeader.slice(7);
+  const apiSecret = process.env.SHOPIFY_API_SECRET || "";
+  const verified = verifySessionToken(token, apiSecret);
+  if (!verified) {
+    return res.status(401).json({ valid: false, error: "Invalid or expired token" });
+  }
+  return res.json({ valid: true, shop: verified.shop });
 });
 
 app.get("/health", async (req, res) => {
