@@ -1116,6 +1116,7 @@ function renderLayout({ shop, host, apiKey, title, content, hasSession = false }
 
 function renderLoadingShell(shop, host, apiKey) {
   const apiKeySafe = escapeHtml(apiKey || "");
+  const shopSafe = escapeHtml(shop || "");
   return `<!doctype html>
 <html>
   <head>
@@ -1134,45 +1135,64 @@ function renderLoadingShell(shop, host, apiKey) {
   <body data-has-session="false">
     <div class="shell">
       <p>Loading PriceGuard&hellip;</p>
-      <small>Authenticating with Shopify</small>
+      <small id="pg-status">Authenticating with Shopify</small>
     </div>
     <script>
       (function() {
-        var attempts = 0;
-        var MAX_ATTEMPTS = 30;
+        var shop = '${shopSafe}';
+        var apiKey = '${apiKeySafe}';
+        var statusEl = document.getElementById('pg-status');
+
+        function setStatus(msg) {
+          if (statusEl) statusEl.textContent = msg;
+        }
 
         function exchangeToken(token) {
+          setStatus('Exchanging token...');
           fetch('/auth/session-token', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + token }
           }).then(function(r) {
-            if (r.ok) { location.reload(); }
-          }).catch(function() {});
+            if (r.ok) {
+              setStatus('Success, loading...');
+              location.reload();
+            } else {
+              setStatus('Token exchange failed (' + r.status + '), redirecting...');
+              setTimeout(function() { window.top.location.href = '/install?shop=' + shop; }, 1500);
+            }
+          }).catch(function(e) {
+            setStatus('Network error, redirecting...');
+            setTimeout(function() { window.top.location.href = '/install?shop=' + shop; }, 1500);
+          });
         }
 
-        function poll() {
-          attempts++;
-          if (attempts > MAX_ATTEMPTS) return;
-          if (!window.shopify) { setTimeout(poll, 100); return; }
-
-          if (typeof window.shopify.idToken === 'function') {
+        function tryGetToken() {
+          if (window.shopify && typeof window.shopify.idToken === 'function') {
+            setStatus('Getting session token...');
             window.shopify.idToken().then(function(token) {
               if (token) { exchangeToken(token); }
-            }).catch(function() {});
-          } else if (typeof window.shopify.createApp === 'function') {
-            var hostParam = new URLSearchParams(window.location.search).get('host');
-            if (!hostParam) return;
-            var app = window.shopify.createApp({ apiKey: '${apiKeySafe}', host: hostParam });
-            app.getState().then(function(state) {
-              var token = state && state.token;
-              if (token) { exchangeToken(token); }
-            }).catch(function() {});
+              else { fallbackToOAuth(); }
+            }).catch(function() { fallbackToOAuth(); });
           } else {
-            setTimeout(poll, 100);
+            fallbackToOAuth();
           }
         }
 
-        poll();
+        function fallbackToOAuth() {
+          setStatus('Redirecting to install...');
+          window.top.location.href = '/install?shop=' + shop;
+        }
+
+        if (document.readyState === 'complete') {
+          setTimeout(tryGetToken, 500);
+        } else {
+          window.addEventListener('load', function() { setTimeout(tryGetToken, 500); });
+        }
+
+        setTimeout(function() {
+          setStatus('Timeout, redirecting to install...');
+          window.top.location.href = '/install?shop=' + shop;
+        }, 8000);
       })();
     </script>
   </body>
