@@ -1079,7 +1079,7 @@ function renderLayout({ shop, host, apiKey, title, content, hasSession = false }
           const token = state && state.token;
           if (token) {
             sessionStorage.setItem('pg_session_token', token);
-            if (document.body.dataset.hasSession !== 'true') {
+            if (document.body.dataset.hasSession === 'false') {
               fetch('/auth/session-token', {
                 method: 'POST',
                 headers: { 'Authorization': 'Bearer ' + token }
@@ -1147,6 +1147,16 @@ function renderLoadingShell(shop, host, apiKey) {
           if (statusEl) statusEl.textContent = msg;
         }
 
+        // If we exchanged a token and reloaded within the last 5 seconds but still
+        // landed on the loading shell, the cookie didn't persist (e.g. incognito
+        // third-party cookie block). Go straight to OAuth.
+        var lastReload = parseInt(sessionStorage.getItem('pg_reload_ts') || '0', 10);
+        if (Date.now() - lastReload < 5000) {
+          setStatus('Cookie not persisting, redirecting to install...');
+          window.top.location.href = '/install?shop=' + shop;
+          return;
+        }
+
         function exchangeToken(token) {
           setStatus('Exchanging token...');
           fetch('/auth/session-token', {
@@ -1155,7 +1165,8 @@ function renderLoadingShell(shop, host, apiKey) {
           }).then(function(r) {
             if (r.ok) {
               setStatus('Success, loading...');
-              location.reload();
+              sessionStorage.setItem('pg_reload_ts', String(Date.now()));
+              window.top.location.href = window.location.href;
             } else {
               setStatus('Token exchange failed (' + r.status + '), redirecting...');
               setTimeout(function() { window.top.location.href = '/install?shop=' + shop; }, 1500);
@@ -3806,7 +3817,18 @@ app.get("/proxy/prices", async (req, res) => {
   }
 });
 
+app.options("/auth/session-token", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.status(204).end();
+});
+
 app.post("/auth/session-token", async (req, res) => {
+  console.log("[SESSION_EXCHANGE] POST /auth/session-token hit");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+
   const authHeader = req.headers.authorization || "";
   if (!authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ success: false, error: "Missing Bearer token" });
@@ -3814,6 +3836,7 @@ app.post("/auth/session-token", async (req, res) => {
   const token = authHeader.slice(7);
   const apiSecret = process.env.SHOPIFY_API_SECRET || "";
   const verified = verifySessionToken(token, apiSecret);
+  console.log("[SESSION_EXCHANGE] verified:", verified);
   if (!verified) {
     return res.status(401).json({ success: false, error: "Invalid or expired token" });
   }
@@ -3831,6 +3854,7 @@ app.post("/auth/session-token", async (req, res) => {
     res.setHeader("Set-Cookie", `pg_session=${sessionCookieVal}; HttpOnly; Secure; SameSite=None; Max-Age=86400; Path=/`);
     return res.json({ success: true, shop: shopRow.shop_domain });
   } catch (e) {
+    console.log("[SESSION_EXCHANGE] error:", e.message);
     return res.status(500).json({ success: false, error: "Session creation failed" });
   }
 });
