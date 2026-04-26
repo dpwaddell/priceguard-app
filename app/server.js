@@ -1178,7 +1178,7 @@ function renderBrandHero(opts) {
     + (planStatus === 'frozen'
         ? '<div style="margin-top:12px;padding:14px 18px;background:#fef3c7;border:1px solid #fcd34d;border-radius:14px;color:#92400e;font-size:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
           + '<span>⚠️ <strong>Your subscription is frozen.</strong> Please update your payment method in Shopify billing to restore access.</span>'
-          + '<a href="https://admin.shopify.com/store/' + shop.replace('.myshopify.com', '') + '/charges/' + shop.replace('.myshopify.com', '') + '/pricing_plans" target="_blank" style="font-weight:700;color:#92400e;white-space:nowrap;">Shopify billing →</a>'
+          + '<a href="https://admin.shopify.com/store/' + shop.replace('.myshopify.com', '') + '/charges/priceflow-app/pricing_plans" target="_blank" style="font-weight:700;color:#92400e;white-space:nowrap;">Shopify billing →</a>'
           + '</div>'
         : '');
 }
@@ -3982,7 +3982,7 @@ app.get("/plans", requireShopSession, async (req, res) => {
       if (isCurrent) {
         ctaHtml = `<div style="text-align:center;padding:12px;background:#f0fdf4;border-radius:10px;color:#16a34a;font-weight:700;font-size:14px;">Your current plan</div>`
           + (plan.id !== 'free'
-              ? `<a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/${shop.replace('.myshopify.com', '')}/pricing_plans" target="_blank" style="display:block;text-align:center;margin-top:8px;padding:10px 12px;border:1px solid #d1d5db;border-radius:10px;color:#374151;font-size:14px;font-weight:600;text-decoration:none;">Manage subscription →</a>`
+              ? `<a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/priceflow-app/pricing_plans" target="_blank" style="display:block;text-align:center;margin-top:8px;padding:10px 12px;border:1px solid #d1d5db;border-radius:10px;color:#374151;font-size:14px;font-weight:600;text-decoration:none;">Manage subscription →</a>`
               : '');
       } else if (!isLower) {
         ctaHtml = `<a href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=${plan.id}" style="display:block;text-align:center;padding:12px;background:${plan.headerBg};color:#fff;border-radius:10px;font-weight:700;font-size:14px;text-decoration:none;">Upgrade to ${escapeHtml(plan.name)}</a>`;
@@ -4019,7 +4019,7 @@ app.get("/plans", requireShopSession, async (req, res) => {
         ${plans.map(renderPlanCard).join("")}
       </div>
       <div style="margin-top:24px;text-align:center;font-size:13px;color:#9ca3af;">
-        All plans include a 14-day free trial. <a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/${shop.replace('.myshopify.com', '')}/pricing_plans" target="_blank" style="color:#6b7280;">Manage your subscription in Shopify billing →</a>
+        All plans include a 14-day free trial. <a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/priceflow-app/pricing_plans" target="_blank" style="color:#6b7280;">Manage your subscription in Shopify billing →</a>
       </div>
     `;
 
@@ -4161,7 +4161,7 @@ app.get("/settings", requireShopSession, async (req, res) => {
               <a class="btn primary" href="${getEmbeddedAppUrl(shop, host, '/billing/upgrade')}&plan=pro">Upgrade to Pro — ${PLAN_PRICES.pro.display}/mo</a>
               <a class="btn" href="${getEmbeddedAppUrl(shop, host, '/plans')}">See all plans →</a>` : ''}
               ${dashboard.shop.plan_name === 'pro' ? `
-              <span class="muted" style="font-size:13px;">You're on the Pro plan. To cancel or downgrade, manage your subscription in <a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/${shop.replace('.myshopify.com', '')}/pricing_plans" target="_blank" style="color:#0b1f55;">Shopify billing</a>.</span>` : ''}
+              <span class="muted" style="font-size:13px;">You're on the Pro plan. To cancel or downgrade, manage your subscription in <a href="https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/charges/priceflow-app/pricing_plans" target="_blank" style="color:#0b1f55;">Shopify billing</a>.</span>` : ''}
             </div>
           </div>
 
