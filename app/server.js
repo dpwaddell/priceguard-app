@@ -1068,40 +1068,36 @@ function renderLayout({ shop, host, apiKey, title, content, hasSession = false }
     </div>
 
     <script>
-      const host = new URLSearchParams(window.location.search).get("host");
-      if (host && window.shopify && window.shopify.createApp) {
-        const app = window.shopify.createApp({
-          apiKey: "${apiKeySafe}",
-          host,
-          forceRedirect: true
-        });
-        app.getState().then(function(state) {
-          const token = state && state.token;
-          if (token) {
-            sessionStorage.setItem('pg_session_token', token);
-            if (document.body.dataset.hasSession === 'false') {
-              fetch('/auth/session-token', {
-                method: 'POST',
-                headers: { 'Authorization': 'Bearer ' + token }
-              }).then(function(r) {
-                if (r.ok) { location.reload(); }
-              }).catch(function() {});
-            }
+  const host = new URLSearchParams(window.location.search).get("host");
+  if (host && window.shopify) {
+    window.shopify.createApp({ apiKey: "${apiKeySafe}", host, forceRedirect: true });
+    if (typeof window.shopify.idToken === 'function') {
+      window.shopify.idToken().then(function(token) {
+        if (token) {
+          sessionStorage.setItem('pg_session_token', token);
+          if (document.body.dataset.hasSession === 'false') {
+            fetch('/auth/session-token', {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + token }
+            }).then(function(r) {
+              if (r.ok) { location.reload(); }
+            }).catch(function() {});
           }
-        }).catch(function() {});
-
-        const _origFetch = window.fetch;
-        window.fetch = function(url, opts) {
-          opts = opts || {};
-          opts.headers = opts.headers || {};
-          const token = sessionStorage.getItem('pg_session_token');
-          if (token && !opts.headers['Authorization']) {
-            opts.headers['Authorization'] = 'Bearer ' + token;
-          }
-          return _origFetch(url, opts);
-        };
-      }
-    </script>
+        }
+      }).catch(function() {});
+    }
+  }
+  const _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    const token = sessionStorage.getItem('pg_session_token');
+    if (token && !opts.headers['Authorization']) {
+      opts.headers['Authorization'] = 'Bearer ' + token;
+    }
+    return _origFetch(url, opts);
+  };
+</script>
     <div style="margin-top:32px;padding:16px 0 8px;border-top:1px solid #e5e7eb;text-align:center;font-size:13px;color:#9ca3af;">
       &copy; ${new Date().getFullYear()} PriceGuard &middot;
       <a href="/privacy" target="_blank" style="color:#9ca3af;text-decoration:none;">Privacy Policy</a> &middot;
