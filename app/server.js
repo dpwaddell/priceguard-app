@@ -3296,7 +3296,12 @@ async function priceGuardShopifyAdminGraphQL(shopDomain, accessToken, query, var
   if (shopRow && shopRow.token_expires_at) {
     const expiresAt = new Date(shopRow.token_expires_at);
     if (expiresAt <= new Date(Date.now() + 5 * 60 * 1000)) {
-      accessToken = await refreshShopToken(shopDomain);
+      try {
+        accessToken = await refreshShopToken(shopDomain);
+      } catch (refreshErr) {
+        console.warn(`[PRICEGUARD] Token refresh failed for ${shopDomain}, clearing expiry and using existing token:`, refreshErr.message);
+        await pool.query(`UPDATE shops SET token_expires_at = NULL WHERE shop_domain = $1`, [shopDomain]);
+      }
     }
   }
 
@@ -4067,7 +4072,12 @@ app.get("/billing/upgrade", requireShopSession, async (req, res) => {
     if (shopRow.token_expires_at) {
       const expiresAt = new Date(shopRow.token_expires_at);
       if (expiresAt <= new Date(Date.now() + 5 * 60 * 1000)) {
-        accessToken = await refreshShopToken(shop);
+        try {
+          accessToken = await refreshShopToken(shop);
+        } catch (refreshErr) {
+          console.warn(`[PRICEGUARD] Token refresh failed for ${shop}, clearing expiry and using existing token:`, refreshErr.message);
+          await pool.query(`UPDATE shops SET token_expires_at = NULL WHERE shop_domain = $1`, [shop]);
+        }
       }
     }
 
