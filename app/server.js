@@ -4073,7 +4073,16 @@ app.get("/billing/upgrade", requireShopSession, async (req, res) => {
       return res.status(500).send("Failed to create subscription. Please try again.");
     }
 
-    return res.redirect(confirmationUrl);
+    const urlSafe = escapeHtml(confirmationUrl);
+    return res.send(`<!doctype html>
+<html>
+<head>
+  <meta http-equiv="refresh" content="0;url=${urlSafe}">
+</head>
+<body>
+<script>window.top.location.href = "${urlSafe}";</script>
+</body>
+</html>`);
   } catch (e) {
     return res.status(500).send(`Billing upgrade failed: ${escapeHtml(e.message)}`);
   }
